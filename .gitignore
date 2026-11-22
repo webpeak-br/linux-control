@@ -1,0 +1,10 @@
+data/
+prints/
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+.env
+__pycache__/
+.agentes
+CLAUDE.md
