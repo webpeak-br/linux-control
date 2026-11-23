@@ -817,6 +817,7 @@ def security():
 #   fields  formulário que o painel monta; cada campo é validado aqui antes de qualquer execução
 #           (tipos: text, textarea, select, bool, cron; "suggest" pede sugestões do inventário)
 #   fixes   códigos de problema do diagnóstico que a ação resolve (botão "Resolver" na Visão geral)
+#   available  função opcional: quando devolve False, a ação sai do catálogo publicado
 #   sh | run   comando fixo de shell, ou função Python que recebe os parâmetros já validados
 
 LEVELS_BY_MODE = {
@@ -1663,7 +1664,7 @@ ACTIONS = [
      "fixes": ["disk_sectors", "disk_smart"], "run": run_disk_test("long"),
      "desc": "Lê toda a superfície do disco procurando setores defeituosos. Pode levar horas; o servidor continua funcionando."},
     {"id": "fix.smartmontools", "group": "Discos", "label": "Instalar monitor de disco (smartmontools)", "level": "change", "timeout": 900,
-     "placement": "disks", "fixes": ["smart_missing"], "run": run_smartmontools,
+     "placement": "disks", "fixes": ["smart_missing"], "run": run_smartmontools, "available": lambda: not which("smartctl"),
      "desc": "Instala o smartmontools para o painel ler a saúde física dos discos (setores, desgaste, temperatura)."},
     {"id": "ssh.authorize_key", "group": "Usuários", "label": "Autorizar chave SSH", "level": "admin", "placement": "users", "run": run_authorize_key,
      "desc": "Libera o acesso por chave SSH para o root ou para um usuário.",
@@ -1753,7 +1754,8 @@ def allowed_actions(mode):
 
 
 def action_catalog(mode):
-    return [{k: a[k] for k in PUBLIC_KEYS if k in a} for a in allowed_actions(mode)]
+    """Catálogo publicado: ações com "available" só aparecem quando fazem sentido (ex.: instalar o que falta)."""
+    return [{k: a[k] for k in PUBLIC_KEYS if k in a} for a in allowed_actions(mode) if a.get("available", lambda: True)()]
 
 
 def validate_params(action, raw):

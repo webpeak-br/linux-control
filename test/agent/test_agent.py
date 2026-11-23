@@ -314,3 +314,11 @@ class SaudeDosDiscos(unittest.TestCase):
             rc, _ = agent.run_authorize_key({"user": "www-data", "ssh_key": "x"}, {})
         self.assertEqual(rc, 1)
         inst.assert_not_called()
+
+
+class CatalogoDinamico(unittest.TestCase):
+    def test_instalar_monitor_some_quando_ja_instalado(self):
+        with mock.patch.object(agent, "which", return_value="/usr/sbin/smartctl"):
+            self.assertNotIn("fix.smartmontools", {a["id"] for a in agent.action_catalog("all")})
+        with mock.patch.object(agent, "which", return_value=None):
+            self.assertIn("fix.smartmontools", {a["id"] for a in agent.action_catalog("all")})
