@@ -165,3 +165,77 @@ class Segredos(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorrecoesDoDiagnostico(unittest.TestCase):
+    ACCOUNTS = [{"name": "root", "uid": 0, "sudo": True, "locked": False, "ssh_keys": 0},
+                {"name": "ana", "uid": 1000, "sudo": False, "locked": False, "ssh_keys": 0}]
+
+    def test_nao_desliga_senha_se_nenhum_admin_tem_chave(self):
+        with mock.patch.object(agent, "users", return_value={"accounts": self.ACCOUNTS}), \
+             mock.patch.object(agent, "sshd_effective", return_value={"permitrootlogin": "yes"}), \
+             mock.patch.object(agent, "sshd_apply") as apply:
+            rc, out = agent.run_ssh_password_off({}, {})
+        self.assertEqual(rc, 1)
+        apply.assert_not_called()
+
+    def test_root_com_login_proibido_nao_conta_como_quem_entra_por_chave(self):
+        accounts = [dict(self.ACCOUNTS[0], ssh_keys=1)]
+        with mock.patch.object(agent, "users", return_value={"accounts": accounts}), \
+             mock.patch.object(agent, "sshd_effective", return_value={"permitrootlogin": "no"}):
+            self.assertEqual(agent.admins_with_keys()[0], [])
+
+    def test_nao_bloqueia_senha_do_root_sem_chave_nem_outro_admin(self):
+        with mock.patch.object(agent, "users", return_value={"accounts": self.ACCOUNTS}), \
+             mock.patch.object(agent, "sshd_effective", return_value={}), \
+             mock.patch.object(agent, "sshd_apply") as apply:
+            rc, _ = agent.run_ssh_root_password({}, {})
+        self.assertEqual(rc, 1)
+        apply.assert_not_called()
+
+    def test_root_com_chave_pode_ter_a_senha_bloqueada(self):
+        accounts = [dict(self.ACCOUNTS[0], ssh_keys=1)]
+        with mock.patch.object(agent, "users", return_value={"accounts": accounts}), \
+             mock.patch.object(agent, "sshd_effective", return_value={}), \
+             mock.patch.object(agent, "sshd_apply", return_value=(0, "ok")) as apply:
+            rc, _ = agent.run_ssh_root_password({}, {})
+        self.assertEqual(rc, 0)
+        apply.assert_called_once_with("PermitRootLogin", "prohibit-password")
+
+    def test_firewall_novo_mantem_ssh_e_portas_publicas_mas_nao_loopback(self):
+        listening = [{"proto": "tcp", "addr": "0.0.0.0", "port": 443}, {"proto": "tcp", "addr": "127.0.0.1", "port": 7420},
+                     {"proto": "udp", "addr": "[::]", "port": 51820}, {"proto": "tcp", "addr": "[::1]", "port": 5432},
+                     {"proto": "tcp", "addr": "[::ffff:127.0.0.1]", "port": 6379}]
+        with mock.patch.object(agent, "ports", return_value=listening), mock.patch.object(agent, "ssh_ports", return_value={2222}):
+            self.assertEqual(agent.public_listeners(), {(443, "tcp"), (51820, "udp"), (2222, "tcp")})
+
+    def test_toda_acao_que_altera_pede_recoleta_do_inventario(self):
+        state = {}
+        with mock.patch.object(agent, "run", return_value=(0, "")):
+            agent.execute_action({"action": "cleanup.tmp", "params": {}}, "all", state)
+        self.assertTrue(state.get("force_inventory"))
+
+    def test_correcoes_publicam_os_codigos_que_resolvem(self):
+        cat = {a["id"]: a for a in agent.action_catalog("all")}
+        self.assertIn("ssh_password_auth", cat["fix.ssh_password_off"]["fixes"])
+        self.assertIn("updates_security", cat["security.apply_security"]["fixes"])
+
+    def test_nao_afrouxa_root_que_ja_esta_restrito(self):
+        with mock.patch.object(agent, "sshd_effective", return_value={"permitrootlogin": "no"}), \
+             mock.patch.object(agent, "sshd_apply") as apply:
+            rc, _ = agent.run_ssh_root_password({}, {})
+        self.assertEqual(rc, 0)
+        apply.assert_not_called()
+
+    def test_nao_desliga_senha_com_login_por_chave_desligado(self):
+        accounts = [dict(self.ACCOUNTS[0], ssh_keys=1)]
+        with mock.patch.object(agent, "users", return_value={"accounts": accounts}), \
+             mock.patch.object(agent, "sshd_effective", return_value={"pubkeyauthentication": "no"}), \
+             mock.patch.object(agent, "sshd_apply") as apply:
+            rc, _ = agent.run_ssh_password_off({}, {})
+        self.assertEqual(rc, 1)
+        apply.assert_not_called()
+
+    def test_admin_fora_do_allowusers_nao_conta(self):
+        self.assertFalse(agent.ssh_user_allowed({"allowusers": "deploy"}, "root"))
+        self.assertTrue(agent.ssh_user_allowed({"allowusers": "root@10.0.0.*"}, "root"))

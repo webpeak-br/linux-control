@@ -1,6 +1,7 @@
 import { api } from '../../api.js';
 import { esc, N, bar, bytes, rate, dt, ago } from '../../util.js';
 import { chartsHtml, bindCharts } from '../../chart.js';
+import { fixButtons } from '../../actions.js';
 
 export const label = 'Visão geral';
 export const state = { range: '1h' };
@@ -18,7 +19,11 @@ async function loadHistory(id) {
 export function body(s) {
   const m = s.metrics || {}, inv = s.inventory || {}, sys = inv.system || {}, mem = m.mem || {}, lv = s.levels || {};
   const issues = s.health.issues.length
-    ? s.health.issues.map(i => `<div class="issue"><span class="dot ${i.level}"></span><span>${esc(i.text)}</span><span class="area">${esc(i.area)}</span></div>`).join('')
+    ? s.health.issues.map(i => {
+      const btns = fixButtons(s, i) + (i.see ? `<a class="btn sm ghost" href="#/server/${s.id}/${esc(i.see)}">Ver detalhes</a>` : '');
+      return `<div class="issue"><span class="dot ${i.level}"></span><span class="txt">${esc(i.text)}</span><span class="area">${esc(i.area)}</span>
+        ${btns ? `<div class="fix">${btns}</div>` : ''}</div>`;
+    }).join('')
     : '<div class="issue"><span class="dot ok"></span>Nenhum problema detectado.</div>';
   const disks = (m.disks || []).map(d => `<tr><td>${esc(d.mount)}<div class="dim small">${esc(d.fs)} · ${bytes(d.free)} livres · inodes ${N(d.inode_pct)}%</div></td>
     <td class="w35">${bar(d.pct, (lv.disks || {})[d.mount])}</td><td class="num">${N(d.pct)}%</td><td class="num">${bytes(d.used)} / ${bytes(d.total)}</td></tr>`).join('');

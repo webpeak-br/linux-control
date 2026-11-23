@@ -32,10 +32,13 @@ const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
 const cleanTags = t => String(t || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 10).join(',');
 const cleanName = (n, fallback = '') => String(n || '').trim().slice(0, NAME_MAX) || fallback;
 
+const ISSUE_CODE = /^[a-z_]{1,40}$/;
+
 function cleanCatalog(actions) {
   return (Array.isArray(actions) ? actions : []).filter(a => a && ACTION_ID.test(a.id) && LEVELS.has(a.level)
     && (!a.target || TARGETS.has(a.target))
-    && (a.fields || []).every(f => f && FIELD_NAME.test(f.name) && FIELD_TYPES.has(f.type)));
+    && (a.fields || []).every(f => f && FIELD_NAME.test(f.name) && FIELD_TYPES.has(f.type)))
+    .map(a => (a.fixes === undefined ? a : { ...a, fixes: (Array.isArray(a.fixes) ? a.fixes : []).filter(c => typeof c === 'string' && ISSUE_CODE.test(c)) }));
 }
 
 function fromRow(row) {

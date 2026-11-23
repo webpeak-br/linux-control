@@ -27,6 +27,16 @@ export function placementButtons(server, place) {
     .map(a => `<button class="btn sm primary" data-run="${esc(a.id)}">+ ${esc(a.label)}</button>`).join(' ');
 }
 
+// Botões ao lado de um problema do diagnóstico: as ações que declaram o código dele em "fixes".
+// As que mudam o servidor vêm primeiro (resolvem); as de leitura depois (ajudam a investigar).
+export function fixButtons(server, issue) {
+  const order = a => (a.level === 'read' ? 1 : 0);
+  return catalog(server).filter(a => (a.fixes || []).includes(issue.code))
+    .sort((x, y) => order(x) - order(y))
+    .map(a => `<button class="btn sm ${a.level === 'read' ? 'ghost' : isDangerous(a) ? 'danger' : 'primary'}" data-run="${esc(a.id)}"
+      title="${esc(a.desc)}">${a.level === 'read' ? '' : 'Resolver: '}${esc(a.label)}</button>`).join('');
+}
+
 export function actionRow(a) {
   return `<div class="act"><div><div class="t">${esc(a.label)} ${LEVEL_PILL[a.level] || ''}</div><div class="d">${esc(a.desc)}</div></div>
     <button class="btn sm ${btnClass(a)}" data-run="${esc(a.id)}">Executar</button></div>`;

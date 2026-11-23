@@ -90,6 +90,15 @@ O modo admin é equivalente a dar root pelo painel (um cron roda qualquer comand
 - O cabeçalho `X-LCtl` aparece em `server.js` e em `api.js`: o navegador não importa código do servidor. Os testes usam a constante exportada.
 - `health.js` usa 30 s quando o agente não informou o intervalo: é o fallback de dado ausente, não uma cópia de configuração.
 
+## Resolver pelo diagnóstico
+
+Cada problema do diagnóstico (`hub/features/servers/health.js`) tem um `code` e, quando existe, `see` (a aba com o detalhe). Uma ação do agente declara em `fixes` os códigos que resolve; a Visão geral mostra ao lado do problema um botão para cada ação do catálogo com aquele código. O hub e a interface não citam ids de ação, e um teste garante que todo código de `fixes` existe no diagnóstico.
+
+- As ações que mudam o servidor aparecem primeiro como "Resolver: …"; as de leitura ajudam a investigar.
+- Toda ação que não é de leitura pede uma recoleta do inventário, para o problema sumir do painel no ciclo seguinte.
+- SSH: a opção é gravada em `/etc/ssh/sshd_config.d/00-linux-control.conf` (lido antes do `50-cloud-init.conf`; no sshd vale o primeiro valor) ou no topo do `sshd_config`. Antes de valer, passa por `sshd -t` e é desfeita se falhar. A ação recusa quando ninguém mais conseguiria entrar (nenhum administrador com chave).
+- Firewall: liga o UFW (ou firewalld) mantendo abertas o SSH e todas as portas que já escutam fora do loopback.
+
 ## Protocolo agente ↔ hub
 
 - `POST /api/agent/report` com `Authorization: Bearer <token>` e corpo `{ agent_version, interval, metrics, results: [{id, exit_code, output, duration}], inventory? }`. O inventário traz `actions` (catálogo) e, a cada 6 h, `packages`.

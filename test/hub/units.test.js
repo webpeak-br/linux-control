@@ -56,3 +56,20 @@ test('a versão do agente acompanha a versão do projeto', () => {
   const agent = fs.readFileSync(path.join(__dirname, '../../agent/linux-control-agent.py'), 'utf8');
   assert.equal(agent.match(/^VERSION = "([^"]+)"/m)[1], pkg.version);
 });
+
+test('todo código em "fixes" do agente existe no diagnóstico do hub', () => {
+  const agent = fs.readFileSync(path.join(__dirname, '../../agent/linux-control-agent.py'), 'utf8');
+  const health = fs.readFileSync(path.join(__dirname, '../../hub/features/servers/health.js'), 'utf8');
+  const codes = new Set([...agent.matchAll(/"fixes": \[([^\]]*)\]/g)].flatMap(m => [...m[1].matchAll(/"([a-z_]+)"/g)].map(x => x[1])));
+  assert.ok(codes.size > 10);
+  for (const c of codes) assert.ok(health.includes(`'${c}'`), `código sem problema correspondente: ${c}`);
+});
+
+test('problemas do diagnóstico trazem código e, quando há, a aba de detalhe', () => {
+  const inv = { system: { is_root: true }, security: { ssh: { permitrootlogin: 'yes', passwordauthentication: 'yes' }, firewall: { active: false } } };
+  const issues = evaluate({ last_seen: now, metrics: {}, inventory: inv }, now).issues;
+  const byCode = Object.fromEntries(issues.map(i => [i.code, i]));
+  assert.equal(byCode.ssh_root_password.see, 'security');
+  assert.ok(byCode.ssh_password_auth && byCode.firewall_off);
+  assert.ok(issues.every(i => /^[a-z_]+$/.test(i.code)));
+});

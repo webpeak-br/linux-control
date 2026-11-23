@@ -678,6 +678,7 @@ def security():
 #   placement  aba onde a ação ganha um botão próprio no topo (ex.: "users")
 #   fields  formulário que o painel monta; cada campo é validado aqui antes de qualquer execução
 #           (tipos: text, textarea, select, bool, cron; "suggest" pede sugestões do inventário)
+#   fixes   códigos de problema do diagnóstico que a ação resolve (botão "Resolver" na Visão geral)
 #   sh | run   comando fixo de shell, ou função Python que recebe os parâmetros já validados
 
 LEVELS_BY_MODE = {
@@ -1069,6 +1070,285 @@ def run_timezone(p, state):
     return run(["timedatectl", "set-timezone", p["timezone"]], timeout=30)
 
 
+# ---------------------------------------------------------------- correções do diagnóstico
+#
+# Cada ação abaixo declara em "fixes" os códigos de problema do diagnóstico (hub/features/servers/health.js)
+# que ela resolve. O painel mostra o botão "Resolver" ao lado do problema sem conhecer o id da ação.
+
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+SSHD_DROPIN = "/etc/ssh/sshd_config.d/00-linux-control.conf"
+
+
+def sshd_effective():
+    """Configuração em uso (sshd -T). Opções que podem repetir (allowusers…) ficam com os valores juntos."""
+    os.makedirs("/run/sshd", exist_ok=True) if os.geteuid() == 0 else None  # sshd -T falha sem ela (Ubuntu com ssh.socket)
+    rc, out = run(["sshd", "-T"], timeout=10, merge=False) if which("sshd") else (1, "")
+    eff = {}
+    for l in out.splitlines() if rc == 0 else []:
+        k, _, v = l.partition(" ")
+        eff[k] = (eff[k] + " " + v) if k in eff else v
+    return eff
+
+
+DEFAULT_KEY_FILES = {".ssh/authorized_keys", ".ssh/authorized_keys2", "%h/.ssh/authorized_keys", "%h/.ssh/authorized_keys2"}
+
+
+def ssh_key_login_blocker(eff):
+    """Motivo pelo qual não dá para garantir o login por chave, ou "" se a configuração é a padrão."""
+    if eff.get("pubkeyauthentication", "yes") != "yes":
+        return "PubkeyAuthentication está desligado: ninguém entra por chave."
+    if eff.get("authenticationmethods", "any") != "any":
+        return "AuthenticationMethods personalizado (%s)." % eff["authenticationmethods"]
+    if not set(eff.get("authorizedkeysfile", ".ssh/authorized_keys").split()) <= DEFAULT_KEY_FILES \
+            or eff.get("authorizedkeyscommand", "none") != "none":
+        return "As chaves ficam num lugar personalizado (AuthorizedKeysFile/AuthorizedKeysCommand)."
+    return ""
+
+
+def ssh_user_allowed(eff, name):
+    import fnmatch
+    import grp
+    deny = eff.get("denyusers", "").split()
+    allow = eff.get("allowusers", "").split()
+    if any(fnmatch.fnmatch(name, x.split("@")[0]) for x in deny):
+        return False
+    if allow and not any(fnmatch.fnmatch(name, x.split("@")[0]) for x in allow):
+        return False
+    groups = set()
+    try:
+        pw = pwd.getpwnam(name)
+        groups = {g.gr_name for g in grp.getgrall() if name in g.gr_mem} | {grp.getgrgid(pw.pw_gid).gr_name}
+    except (KeyError, OSError):
+        pass
+    if any(fnmatch.fnmatch(g, x) for g in groups for x in eff.get("denygroups", "").split()):
+        return False
+    ag = eff.get("allowgroups", "").split()
+    return not ag or any(fnmatch.fnmatch(g, x) for g in groups for x in ag)
+
+
+ROOT_KEY_OK = ("yes", "prohibit-password", "without-password")
+
+
+def admins_with_keys(eff=None):
+    """Administradores que continuam entrando por chave: com chave, desbloqueados e liberados pelo sshd."""
+    eff = eff if eff is not None else sshd_effective()
+    accounts = safe(users, {}).get("accounts", [])
+    res = [u["name"] for u in accounts if u["ssh_keys"] and not u["locked"] and u["sudo"] and ssh_user_allowed(eff, u["name"])
+           and (u["uid"] != 0 or eff.get("permitrootlogin", "yes") in ROOT_KEY_OK)]
+    return res, accounts
+
+
+def write_atomic(path, content):
+    """Grava num temporário da mesma pasta e troca de uma vez, mantendo dono e permissão do original."""
+    st = os.stat(path) if os.path.exists(path) else None
+    tmp = path + ".lctl-tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, st.st_mode & 0o7777 if st else 0o600)
+    if st:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, path)
+
+
+def sshd_write(path, key, value, prepend):
+    """Grava a opção e devolve o conteúdo anterior (None se o arquivo não existia)."""
+    before = read(path) if os.path.exists(path) else None
+    if prepend:
+        content = "# Linux Control\n%s %s\n%s" % (key, value, before or "")
+    else:
+        lines = [l for l in (before or "").splitlines() if not l.lower().startswith(key.lower() + " ")]
+        content = "\n".join(["# Gerenciado pelo Linux Control"] * (not lines) + lines + ["%s %s" % (key, value)]) + "\n"
+    write_atomic(path, content)
+    return before
+
+
+def sshd_restore(written):
+    for path, before in reversed(written):
+        if before is None:
+            os.remove(path)
+        else:
+            write_atomic(path, before)
+
+
+SSHD_SAME = {"without-password": "prohibit-password"}
+
+
+def sshd_apply(key, value):
+    """Grava a opção no arquivo do painel em sshd_config.d (lido antes dos outros: no sshd vale o primeiro valor)
+    ou no topo do sshd_config; confere com sshd -t, desfaz se der erro e recarrega o SSH sem derrubar sessões."""
+    if not which("sshd"):
+        return 1, "sshd não encontrado neste servidor."
+    os.makedirs("/run/sshd", exist_ok=True)
+    has_include = os.path.isdir(os.path.dirname(SSHD_DROPIN)) and re.search(
+        r"^\s*Include\s+/etc/ssh/sshd_config\.d/", read(SSHD_CONFIG), re.M | re.I)
+    targets = ([SSHD_DROPIN] if has_include else []) + [SSHD_CONFIG]
+    written, now = [], "?"
+    for path in targets:
+        written.append((path, sshd_write(path, key, value, prepend=path == SSHD_CONFIG)))
+        rc, out = run(["sshd", "-t"], timeout=10)
+        if rc != 0:
+            sshd_restore(written)
+            return 1, "Configuração recusada pelo sshd -t, nada foi alterado:\n" + out
+        now = sshd_effective().get(key.lower(), "?")
+        if SSHD_SAME.get(now, now) == value:
+            break
+    else:
+        sshd_restore(written)
+        return 1, "O sshd continuou usando %s %s mesmo depois da mudança; nada foi alterado. Confira o sshd_config manualmente." % (key, now)
+    rc, out = run(["/bin/sh", "-c", "systemctl reload ssh 2>&1 || systemctl reload sshd 2>&1"], timeout=20)
+    msg = "%s %s gravado em %s. Sessões abertas continuam conectadas." % (key, value, ", ".join(p for p, _ in written))
+    if rc != 0:
+        socket = run(["systemctl", "is-active", "ssh.socket"], timeout=10, merge=False)[1].strip() == "active"
+        msg += ("\nO SSH é iniciado por socket: cada conexão nova já usa a configuração nova." if socket else
+                "\nAtenção: não consegui recarregar o SSH (%s). A mudança vale no próximo reinício do serviço." % out.strip()[:200])
+    if re.search(r"^\s*Match\s", read(SSHD_CONFIG) + "".join(read(f) for f in glob.glob("/etc/ssh/sshd_config.d/*.conf")), re.M | re.I):
+        msg += "\nHá blocos Match no sshd_config: eles podem manter regras diferentes para alguns usuários ou IPs."
+    return 0, msg
+
+
+def run_ssh_root_password(p, state):
+    eff = sshd_effective()
+    if eff.get("permitrootlogin") in ("no", "prohibit-password", "without-password", "forced-commands-only"):
+        return 0, "Nada a fazer: o root já não entra com senha (PermitRootLogin %s)." % eff["permitrootlogin"]
+    keys, accounts = admins_with_keys(eff)
+    blocker = ssh_key_login_blocker(eff)
+    root_key = "root" in keys and not blocker
+    others = [u["name"] for u in accounts if u["sudo"] and u["uid"] != 0 and not u["locked"] and ssh_user_allowed(eff, u["name"])]
+    if not root_key and not others:
+        return 1, ("Recusado: o root não tem chave SSH utilizável e não há outro administrador. Depois da mudança ninguém entraria como root.\n"
+                   + (blocker + "\n" if blocker else "")
+                   + "Adicione uma chave em /root/.ssh/authorized_keys ou crie um usuário admin na aba Usuários.")
+    rc, out = sshd_apply("PermitRootLogin", "prohibit-password")
+    return rc, out + ("\nO root continua entrando com chave SSH." if root_key else "\nEntre com um dos administradores: " + ", ".join(others))
+
+
+def run_ssh_password_off(p, state):
+    eff = sshd_effective()
+    if eff.get("passwordauthentication") == "no":
+        return 0, "Nada a fazer: o SSH já não aceita senha."
+    blocker = ssh_key_login_blocker(eff)
+    if blocker:
+        return 1, "Recusado: " + blocker + " Desligar a senha poderia trancar todo mundo do lado de fora; faça a mudança manualmente."
+    keys, accounts = admins_with_keys(eff)
+    if not keys:
+        return 1, ("Recusado: nenhum administrador liberado no SSH tem chave cadastrada. Desligar a senha trancaria todo mundo do lado de fora.\n"
+                   "Adicione uma chave SSH a um administrador (aba Usuários) e tente de novo.")
+    rc, out = sshd_apply("PasswordAuthentication", "no")
+    no_key = [u["name"] for u in accounts if not u["ssh_keys"] and not u["locked"]]
+    out += "\nContinuam entrando por chave: " + ", ".join(keys)
+    if no_key:
+        out += "\nSem chave (perdem o acesso por SSH): " + ", ".join(no_key)
+    return rc, out
+
+
+def install_packages_cmd(pkgs):
+    pm = package_manager()
+    if pm == "apt":
+        return "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y install " + " ".join(pkgs)
+    if pm in ("dnf", "yum"):
+        return "%s -y install %s" % (pm, " ".join(pkgs))
+    return None
+
+
+def run_install_app(app_id):
+    return lambda p, state: run_app(False)({"app": app_id}, state)
+
+
+def run_fail2ban(p, state):
+    if not which("fail2ban-client"):
+        rc, out = run_app(False)({"app": "fail2ban"}, state)
+        if rc != 0:
+            return rc, out
+    else:
+        out = "Fail2ban já instalado.\n"
+    ports = ",".join(str(x) for x in sorted(ssh_ports()))
+    backend = "" if os.path.exists("/var/log/auth.log") or os.path.exists("/var/log/secure") else "backend = systemd\n"
+    os.makedirs("/etc/fail2ban/jail.d", exist_ok=True)
+    with open("/etc/fail2ban/jail.d/linux-control.conf", "w") as f:
+        f.write("# Gerenciado pelo Linux Control\n[sshd]\nenabled = true\nport = %s\n%smaxretry = 5\nfindtime = 600\nbantime = 3600\nignoreip = 127.0.0.1/8 ::1\n" % (ports, backend))
+    rc, out2 = run(["/bin/sh", "-c", "systemctl enable fail2ban >/dev/null 2>&1; systemctl restart fail2ban && sleep 2 && fail2ban-client status sshd"], timeout=60)
+    state["force_inventory"] = True
+    return rc, out[-2000:] + "\nProteção do SSH ligada (5 tentativas em 10 min = bloqueio de 1 h).\n" + out2
+
+
+def public_listeners():
+    """Portas escutando fora do loopback: o firewall novo precisa mantê-las abertas para nada parar de funcionar.
+    UDP sem processo também fica (o WireGuard do kernel escuta assim)."""
+    keep = set()
+    for r in ports():
+        a = r["addr"].strip("[]").split("%")[0]
+        if not isinstance(r["port"], int) or a.startswith(("127.", "::ffff:127.")) or a == "::1":
+            continue
+        udp = r["proto"].startswith("udp")
+        keep.add((r["port"], "udp" if udp else "tcp"))
+    return keep | {(x, "tcp") for x in ssh_ports()}
+
+
+def run_enable_firewall(p, state):
+    keep = sorted(public_listeners())
+    specs = ["%d/%s" % k for k in keep]
+    ssh_specs = ["%d/tcp" % x for x in sorted(ssh_ports())]
+    pm = package_manager()
+    if not which("ufw") and not which("firewall-cmd"):
+        cmd = install_packages_cmd(["firewalld"] if pm in ("dnf", "yum") else ["ufw"])
+        if not cmd:
+            return 1, "Gerenciador de pacotes não suportado para instalar um firewall."
+        rc, out = run(["/bin/sh", "-c", cmd], timeout=900)
+        if rc != 0 or not (which("ufw") or which("firewall-cmd")):
+            return 1, "Não consegui instalar o firewall:\n" + out[-3000:]
+    if which("ufw"):
+        # Só liga depois de conferir que o SSH está na lista: sem isso o servidor ficaria inacessível.
+        check = " && ".join("ufw show added | grep -qw 'allow %s'" % x for x in ssh_specs)
+        script = ("set -e; " + "; ".join("ufw allow %s" % x for x in specs) + "; " + check
+                  + " && ufw --force enable && ufw status verbose")
+    else:
+        script = ("set -e; systemctl enable --now firewalld; " + "; ".join("firewall-cmd --permanent --add-port=%s" % x for x in specs)
+                  + "; firewall-cmd --reload; firewall-cmd --list-all")
+    rc, out = run(["/bin/sh", "-c", script], timeout=120)
+    note = ""
+    if rc == 0 and which("docker"):
+        r2, _ = run(["systemctl", "restart", "docker"], timeout=180)
+        note = "\nDocker reiniciado para refazer as regras de rede dos containers." if r2 == 0 else "\nAtenção: reinicie o Docker para refazer as regras de rede dos containers."
+    if rc != 0:
+        return rc, "Firewall NÃO foi ativado (alguma liberação falhou):\n" + out
+    return 0, "Portas mantidas abertas (SSH e tudo que já escutava na rede): %s\n\n%s%s" % (", ".join(specs), out, note)
+
+
+def run_restart_failed(p, state):
+    rc, out = run(["systemctl", "list-units", "--state=failed", "--no-legend", "--plain", "--type=service"], timeout=20, merge=False)
+    names = [l.split()[0] for l in out.splitlines() if l.strip() and re.fullmatch(UNIT_RE, l.split()[0])]
+    if not names:
+        return 0, "Nenhum serviço com falha agora."
+    lines, deadline = [], time.time() + 480
+    if len(names) > 20:
+        lines.append("%d serviços com falha; tentando os 20 primeiros." % len(names))
+        names = names[:20]
+    for n in names:
+        if time.time() > deadline:
+            lines.append("Tempo esgotado; os demais ficaram para a próxima execução.")
+            break
+        run(["systemctl", "reset-failed", "--", n], timeout=20)
+        r, o = run(["systemctl", "restart", "--", n], timeout=120)
+        st = run(["systemctl", "is-active", "--", n], timeout=10, merge=False)[1].strip()
+        lines.append("%s: %s%s" % (n, st, "" if r == 0 else "\n  " + o.strip().replace("\n", "\n  ")[:600]))
+    state["force_inventory"] = True
+    still = [l for l in lines if ": " in l and not l.split(": ", 1)[1].startswith("active")]
+    return (1 if still else 0), "\n".join(lines) + ("\n\nVeja os logs dos que continuam falhando na aba Serviços." if still else "")
+
+
+NTP_SH = ("if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?|ntpd?)\\.service'; then "
+          "echo 'Nenhum serviço de hora encontrado; instalando o chrony.'; "
+          "if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else dnf -y -q install chrony || yum -y -q install chrony; fi; "
+          "systemctl enable --now chrony 2>/dev/null || systemctl enable --now chronyd; fi; "
+          "timedatectl set-ntp true 2>&1 || true; sleep 3; "
+          "if ! timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then "
+          "systemctl restart systemd-timesyncd 2>/dev/null || systemctl restart chronyd 2>/dev/null || systemctl restart chrony 2>/dev/null; sleep 10; fi; "
+          "timedatectl; timedatectl show -p NTPSynchronized --value | grep -q yes "
+          "|| { echo; echo 'Ainda não sincronizou: confira se a porta 123/udp de saída está liberada.'; exit 1; }")
+
+
 PKG_SH = {
     "updates": "if command -v apt-get >/dev/null; then apt-get update -qq && apt list --upgradable 2>/dev/null; "
                "elif command -v dnf >/dev/null; then dnf -q check-update; dnf -q updateinfo list security; "
@@ -1090,47 +1370,47 @@ TIMEZONES = ["America/Sao_Paulo", "America/Manaus", "America/Fortaleza", "Americ
              "America/Los_Angeles", "Europe/Lisbon", "Europe/London"]
 
 ACTIONS = [
-    {"id": "health.overview", "group": "Saúde", "label": "Diagnóstico rápido", "level": "read",
+    {"id": "health.overview", "fixes": ["cpu_high", "load_high"], "group": "Saúde", "label": "Diagnóstico rápido", "level": "read",
      "desc": "Uptime, memória, discos e processos que mais consomem.",
      "sh": "uptime; echo; free -h; echo; df -hT -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null; echo; "
            "ps -eo pid,user,%cpu,%mem,etime,comm --sort=-%cpu | head -20"},
-    {"id": "health.failed_services", "group": "Saúde", "label": "Serviços com falha", "level": "read",
+    {"id": "health.failed_services", "fixes": ["services_failed"], "group": "Saúde", "label": "Serviços com falha", "level": "read",
      "desc": "Lista serviços systemd em estado de falha.", "sh": "systemctl --failed --no-pager"},
     {"id": "health.journal_errors", "group": "Saúde", "label": "Erros do sistema (24h)", "level": "read",
      "desc": "Últimos 200 erros registrados no journal nas últimas 24 horas.",
      "sh": "journalctl -p err --since=-24h --no-pager -n 200"},
-    {"id": "health.disk_hogs", "group": "Saúde", "label": "O que ocupa o disco", "level": "read", "timeout": 300,
+    {"id": "health.disk_hogs", "fixes": ["disk_full", "inode_full"], "group": "Saúde", "label": "O que ocupa o disco", "level": "read", "timeout": 300,
      "desc": "Maiores pastas na raiz e em /var, e arquivos acima de 500 MB.",
      "sh": "echo '== Maiores pastas em / =='; du -xh --max-depth=1 / 2>/dev/null | sort -rh | head -15; "
            "echo; echo '== Maiores pastas em /var =='; du -xh --max-depth=2 /var 2>/dev/null | sort -rh | head -15; "
            "echo; echo '== Arquivos > 500 MB =='; find / -xdev -type f -size +500M -exec ls -lh {} + 2>/dev/null | awk '{print $5, $9}' | sort -rh | head -20"},
-    {"id": "health.memory_detail", "group": "Saúde", "label": "Detalhe de memória", "level": "read",
+    {"id": "health.memory_detail", "fixes": ["mem_high", "swap_high"], "group": "Saúde", "label": "Detalhe de memória", "level": "read",
      "desc": "Uso de memória por processo (RSS) e swap.",
      "sh": "free -m; echo; ps -eo pid,user,rss,%mem,comm --sort=-rss | head -25 | awk 'NR==1{print;next}{printf \"%s %s %.0fMB %s %s\\n\",$1,$2,$3/1024,$4,$5}'"},
     {"id": "health.connections", "group": "Saúde", "label": "Conexões de rede ativas", "level": "read",
      "desc": "Resumo de conexões TCP e principais IPs remotos.",
      "sh": "ss -s; echo; echo '== Top IPs remotos =='; ss -tnH state established | awk '{print $4}' | sed 's/:[0-9]*$//' | sort | uniq -c | sort -rn | head -20"},
-    {"id": "cleanup.packages", "group": "Limpeza", "label": "Limpar cache de pacotes", "level": "change", "timeout": 600,
+    {"id": "cleanup.packages", "fixes": ["disk_full"], "group": "Limpeza", "label": "Limpar cache de pacotes", "level": "change", "timeout": 600,
      "desc": "Remove pacotes órfãos e limpa o cache do gerenciador de pacotes.", "sh": PKG_SH["clean"]},
-    {"id": "cleanup.journal", "group": "Limpeza", "label": "Reduzir logs do journal", "level": "change",
+    {"id": "cleanup.journal", "fixes": ["disk_full"], "group": "Limpeza", "label": "Reduzir logs do journal", "level": "change",
      "desc": "Mantém só os últimos 7 dias (máx. 500 MB) de logs do systemd.",
      "sh": "journalctl --disk-usage; journalctl --vacuum-time=7d --vacuum-size=500M; journalctl --disk-usage"},
-    {"id": "cleanup.tmp", "group": "Limpeza", "label": "Limpar /tmp antigo", "level": "change",
+    {"id": "cleanup.tmp", "fixes": ["disk_full", "inode_full"], "group": "Limpeza", "label": "Limpar /tmp antigo", "level": "change",
      "desc": "Apaga arquivos em /tmp e /var/tmp sem acesso há mais de 7 dias.",
      "sh": "find /tmp /var/tmp -xdev -type f -atime +7 -print -delete 2>/dev/null | tail -50; echo concluído"},
-    {"id": "cleanup.old_logs", "group": "Limpeza", "label": "Apagar logs rotacionados", "level": "change",
+    {"id": "cleanup.old_logs", "fixes": ["disk_full"], "group": "Limpeza", "label": "Apagar logs rotacionados", "level": "change",
      "desc": "Remove logs compactados antigos (*.gz, *.1) em /var/log.",
      "sh": "du -sh /var/log; find /var/log -type f \\( -name '*.gz' -o -name '*.[0-9]' -o -name '*.old' \\) -mtime +7 -print -delete | tail -50; du -sh /var/log"},
-    {"id": "cleanup.docker", "group": "Limpeza", "label": "Limpar Docker", "level": "change", "timeout": 900,
+    {"id": "cleanup.docker", "fixes": ["disk_full"], "group": "Limpeza", "label": "Limpar Docker", "level": "change", "timeout": 900,
      "desc": "Remove containers parados, imagens sem uso e cache de build (volumes são preservados).",
      "sh": "docker system df; docker system prune -af; docker builder prune -af; echo; docker system df"},
     {"id": "security.updates", "group": "Segurança", "label": "Ver atualizações pendentes", "level": "read", "timeout": 300,
      "desc": "Atualiza o índice de pacotes e lista o que pode ser atualizado.", "sh": PKG_SH["updates"]},
-    {"id": "security.apply_security", "group": "Segurança", "label": "Aplicar atualizações de segurança", "level": "change", "timeout": 1800,
+    {"id": "security.apply_security", "fixes": ["updates_security"], "group": "Segurança", "label": "Aplicar atualizações de segurança", "level": "change", "timeout": 1800,
      "desc": "Instala somente as atualizações de segurança.", "sh": PKG_SH["security"]},
-    {"id": "security.apply_all", "group": "Segurança", "label": "Aplicar todas as atualizações", "level": "danger", "confirm": True, "timeout": 3600,
+    {"id": "security.apply_all", "fixes": ["updates_available", "updates_security"], "group": "Segurança", "label": "Aplicar todas as atualizações", "level": "danger", "confirm": True, "timeout": 3600,
      "desc": "Atualiza todos os pacotes do sistema. Pode reiniciar serviços.", "sh": PKG_SH["all"]},
-    {"id": "security.failed_logins", "group": "Segurança", "label": "Tentativas de invasão SSH", "level": "read",
+    {"id": "security.failed_logins", "fixes": ["ssh_bruteforce"], "group": "Segurança", "label": "Tentativas de invasão SSH", "level": "read",
      "desc": "Últimas tentativas de login SSH que falharam e os IPs de origem.", "run": run_failed_logins},
     {"id": "security.listening", "group": "Segurança", "label": "Portas abertas", "level": "read",
      "desc": "Todos os serviços escutando na rede, com o processo responsável.", "sh": "ss -tulpn"},
@@ -1148,6 +1428,33 @@ ACTIONS = [
     {"id": "firewall.deny", "group": "Segurança", "label": "Fechar porta no firewall", "level": "admin", "confirm": True,
      "desc": "Remove a liberação de uma porta no UFW ou firewalld.", "run": run_firewall(False),
      "fields": [f_text("port", "Porta", r"^[0-9]{1,5}$"), f_select("proto", "Protocolo", ["tcp", "udp"])]},
+    {"id": "fix.ssh_root_password", "group": "Segurança", "label": "Bloquear senha do root no SSH", "level": "danger", "confirm": True,
+     "fixes": ["ssh_root_password"], "run": run_ssh_root_password,
+     "desc": "Root passa a entrar só por chave SSH (PermitRootLogin prohibit-password). Antes de confirmar, garanta que você tem a chave privada do root ou a senha de outro administrador."},
+    {"id": "fix.ssh_password_off", "group": "Segurança", "label": "Desligar login por senha no SSH", "level": "danger", "confirm": True,
+     "fixes": ["ssh_password_auth"], "run": run_ssh_password_off,
+     "desc": "Todos passam a entrar só por chave SSH. Antes de confirmar, garanta que você tem a chave privada de um administrador: quem só usa senha perde o acesso."},
+    {"id": "fix.fail2ban", "group": "Segurança", "label": "Bloquear ataques ao SSH (Fail2ban)", "level": "change", "timeout": 900,
+     "fixes": ["ssh_bruteforce"], "run": run_fail2ban,
+     "desc": "Instala e liga o Fail2ban: IP que errar a senha 5 vezes em 10 minutos fica bloqueado por 1 hora."},
+    {"id": "fix.firewall", "group": "Segurança", "label": "Ativar firewall", "level": "danger", "confirm": True, "timeout": 900,
+     "fixes": ["firewall_off"], "run": run_enable_firewall,
+     "desc": "Liga o UFW (ou firewalld) mantendo abertas o SSH e todas as portas que já recebem conexões hoje. Com Docker, o serviço é reiniciado."},
+    {"id": "fix.auto_updates", "group": "Segurança", "label": "Ligar atualizações automáticas", "level": "change", "timeout": 900,
+     "fixes": ["auto_updates_off"], "run": run_install_app("autoupdates"),
+     "desc": "Instala e liga a instalação automática das atualizações de segurança."},
+    {"id": "fix.restart_failed", "group": "Serviços", "label": "Reiniciar serviços com falha", "level": "change", "timeout": 600,
+     "fixes": ["services_failed"], "run": run_restart_failed,
+     "desc": "Tenta reiniciar cada serviço em falha e mostra quais voltaram."},
+    {"id": "fix.ntp", "group": "Sistema", "label": "Sincronizar relógio", "level": "change", "timeout": 120,
+     "fixes": ["ntp_off"], "sh": NTP_SH,
+     "desc": "Liga a sincronização automática de hora (NTP)."},
+    {"id": "fix.renew_certs", "group": "Segurança", "label": "Renovar certificados (Certbot)", "level": "change", "timeout": 900,
+     "fixes": ["cert_expiring"],
+     "desc": "Renova os certificados Let's Encrypt que estão perto de vencer e recarrega o servidor web.",
+     "sh": "PATH=$PATH:/snap/bin; if ! command -v certbot >/dev/null; then echo 'Certbot não instalado: este certificado é renovado por outra ferramenta.'; exit 1; fi; "
+           "certbot renew --no-random-sleep-on-renew 2>&1; rc=$?; "
+           "systemctl reload nginx 2>/dev/null || systemctl reload apache2 2>/dev/null || systemctl reload httpd 2>/dev/null || true; exit $rc"},
     {"id": "service.logs", "group": "Serviços", "label": "Logs", "level": "read", "target": "service", "fields": F_SERVICE(),
      "desc": "Últimas 200 linhas de log de um serviço.", "run": run_service_logs},
     {"id": "service.status", "group": "Serviços", "label": "Status", "level": "read", "target": "service", "fields": F_SERVICE(),
@@ -1205,7 +1512,7 @@ ACTIONS = [
      "desc": "Força o agente a recoletar serviços, pacotes, segurança e software."},
     {"id": "system.timezone", "group": "Sistema", "label": "Mudar fuso horário", "level": "admin", "run": run_timezone,
      "desc": "Define o fuso horário do servidor.", "fields": [f_select("timezone", "Fuso horário", TIMEZONES)]},
-    {"id": "system.reboot", "group": "Sistema", "label": "Reiniciar servidor", "level": "danger", "confirm": True,
+    {"id": "system.reboot", "fixes": ["reboot_required"], "group": "Sistema", "label": "Reiniciar servidor", "level": "danger", "confirm": True,
      "desc": "Reinicia o servidor em 1 minuto.",
      "sh": "shutdown -r +1 'Reinício solicitado pelo Linux Control' && echo 'Reinício agendado para daqui a 1 minuto.'"},
 ]
@@ -1223,7 +1530,7 @@ for _a in ACTIONS:
         if _a["target"] == "cron":
             _a["when"].insert(0, "managed")
 ACTIONS_BY_ID = {a["id"]: a for a in ACTIONS}
-PUBLIC_KEYS = ("id", "group", "label", "desc", "level", "confirm", "target", "target_field", "placement", "fields", "timeout", "when")
+PUBLIC_KEYS = ("id", "group", "label", "desc", "level", "confirm", "target", "target_field", "placement", "fields", "timeout", "when", "fixes")
 
 
 def allowed_actions(mode):
@@ -1264,6 +1571,8 @@ def execute_action(cmd, mode, state):
     params, err = validate_params(a, cmd.get("params"))
     if err:
         return 2, err
+    if a["level"] != "read":
+        state["force_inventory"] = True  # o diagnóstico do painel reflete a mudança no próximo ciclo
     if "run" in a:
         return a["run"](params, state)
     return run(["/bin/sh", "-c", a["sh"]], timeout=int(a.get("timeout", 120)))
