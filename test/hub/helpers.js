@@ -8,7 +8,7 @@ const { build, CSRF_HEADER } = require('../../hub/server');
 // Sobe um hub isolado (banco temporário, porta livre) e devolve um cliente HTTP simples.
 async function startHub(overrides = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lctl-test-'));
-  const cfg = { ...config, dataDir, host: '127.0.0.1', port: 0, adminPassword: '', licenseUrl: '', releasesUrl: '', ...overrides };
+  const cfg = { ...config, dataDir, host: '127.0.0.1', port: 0, adminPassword: '', licenseUrl: '', releasesUrl: '', geoipUrl: '', ...overrides };
   const app = build(cfg);
   await new Promise(r => app.server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${app.server.address().port}`;

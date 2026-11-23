@@ -352,6 +352,79 @@ def system_info():
     }
 
 
+# ---------------------------------------------------------------- datacenter
+#
+# O provedor é reconhecido pelo DMI (sem rede); só então o agente pergunta a região ao serviço de metadados
+# do próprio provedor (169.254.169.254, que não sai da máquina física). Nada vai para terceiros.
+
+VULTR_REGIONS = {"LAX": "Los Angeles", "SAO": "São Paulo", "EWR": "Nova Jersey", "ORD": "Chicago", "DFW": "Dallas", "SEA": "Seattle",
+                 "MIA": "Miami", "ATL": "Atlanta", "SJC": "Vale do Silício", "YTO": "Toronto", "MEX": "Cidade do México",
+                 "SCL": "Santiago", "LHR": "Londres", "MAN": "Manchester", "FRA": "Frankfurt", "AMS": "Amsterdã", "CDG": "Paris",
+                 "MAD": "Madri", "WAW": "Varsóvia", "STO": "Estocolmo", "NRT": "Tóquio", "ITM": "Osaka", "ICN": "Seul",
+                 "SGP": "Singapura", "SYD": "Sydney", "MEL": "Melbourne", "BOM": "Mumbai", "DEL": "Délhi", "BLR": "Bangalore",
+                 "JNB": "Joanesburgo", "TLV": "Tel Aviv", "HNL": "Honolulu"}
+_cloud_cache = {}
+
+
+def meta_get(url, headers=None, method="GET", timeout=2):
+    """Consulta o serviço de metadados direto, sem proxy."""
+    opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+    req = urlrequest.Request(url, headers=headers or {}, method=method, data=b"" if method == "PUT" else None)
+    with opener.open(req, timeout=timeout) as r:
+        return r.read(65536).decode("utf-8", "replace").strip()
+
+
+def _vultr():
+    reg = json.loads(meta_get("http://169.254.169.254/v1.json")).get("region") or {}
+    code = reg.get("regioncode", "")
+    return {"region": code, "city": VULTR_REGIONS.get(code, ""), "country": reg.get("countrycode", "")}
+
+
+def _aws():
+    tok = meta_get("http://169.254.169.254/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds": "60"}, "PUT")
+    az = meta_get("http://169.254.169.254/latest/meta-data/placement/availability-zone", {"X-aws-ec2-metadata-token": tok})
+    return {"region": az}
+
+
+CLOUDS = [  # (texto no DMI, provedor, como descobrir a região)
+    ("vultr", "Vultr", _vultr),
+    ("amazon", "AWS", _aws),
+    ("google", "Google Cloud", lambda: {"region": meta_get("http://169.254.169.254/computeMetadata/v1/instance/zone",
+                                                           {"Metadata-Flavor": "Google"}).rsplit("/", 1)[-1]}),
+    ("digitalocean", "DigitalOcean", lambda: {"region": meta_get("http://169.254.169.254/metadata/v1/region")}),
+    ("7783-7084-3265-9085-8269-3286-77", "Azure", lambda: {"region": meta_get(
+        "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text", {"Metadata": "true"})}),
+    ("hetzner", "Hetzner", lambda: {"region": meta_get("http://169.254.169.254/hetzner/v1/metadata/availability-zone")}),
+    ("oraclecloud", "Oracle Cloud", lambda: {"region": meta_get("http://169.254.169.254/opc/v2/instance/canonicalRegionName",
+                                                                {"Authorization": "Bearer Oracle"})}),
+    ("linode", "Akamai (Linode)", None),
+    ("contabo", "Contabo", None),
+    ("ovh", "OVHcloud", None),
+    ("hostinger", "Hostinger", None),
+    ("magalu", "Magalu Cloud", None),
+]
+
+
+def cloud_info():
+    """Provedor e região do datacenter. Guardado em memória: não muda enquanto a máquina existir."""
+    if _cloud_cache:
+        return _cloud_cache.get("v")
+    dmi = " ".join(read("/sys/class/dmi/id/" + f).strip() for f in
+                   ("sys_vendor", "product_name", "bios_vendor", "chassis_asset_tag", "board_vendor", "chassis_vendor")).lower()
+    res = None
+    for mark, name, fn in CLOUDS:
+        if mark in dmi:
+            res = {"provider": name}
+            if fn:
+                try:
+                    res.update({k: v for k, v in fn().items() if v})
+                except Exception:
+                    pass  # metadados fora do ar: fica só o provedor
+            break
+    _cloud_cache["v"] = res
+    return res
+
+
 def services():
     if not which("systemctl"):
         return {"available": False, "units": []}
@@ -1583,6 +1656,7 @@ def execute_action(cmd, mode, state):
 def collect_inventory(mode, with_packages):
     inv = {
         "system": safe(system_info, {}),
+        "cloud": safe(cloud_info),
         "services": safe(services, {"available": False, "units": []}),
         "ports": safe(ports, []),
         "docker": safe(docker),

@@ -1,6 +1,7 @@
 'use strict';
 const { HttpError } = require('../../core/http');
 const { evaluate, metricLevel, certLevel, sshLevel } = require('./health');
+const geo = require('./geo');
 
 const migrations = [
   { name: 'servers:1', sql: [
@@ -13,6 +14,7 @@ const migrations = [
       ts INTEGER NOT NULL, cpu REAL, mem REAL, swap REAL, disk REAL, load1 REAL, rx REAL, tx REAL)`,
     'CREATE INDEX IF NOT EXISTS metrics_srv_ts ON metrics(server_id, ts)',
   ] },
+  ...geo.migrations,
 ];
 
 // Séries gravadas a cada relatório e devolvidas pelo histórico.
@@ -81,20 +83,22 @@ function summary(srv) {
   const inv = srv.inventory || {}, m = srv.metrics;
   return {
     id: srv.id, name: srv.name, tags: srv.tags, last_seen: srv.last_seen, remote_ip: srv.remote_ip,
-    agent_version: srv.agent_version, health: srv.health, levels: srv.levels, counts: srv.counts,
+    agent_version: srv.agent_version, health: srv.health, levels: srv.levels, counts: srv.counts, geo: srv.geo, cloud: inv.cloud || null,
     system: inv.system ? { hostname: inv.system.hostname, os: inv.system.os, ips: inv.system.ips } : null,
     metrics: m && m.ts ? { cpu: m.cpu, mem: m.mem && m.mem.pct, load: m.load, uptime: m.uptime } : null,
   };
 }
 
 function create({ db, now, config, features }) {
+  const geoip = geo.createGeo({ db, now, config });
   function row(id) {
     const r = db.prepare('SELECT * FROM servers WHERE id=?').get(id);
     if (!r) throw new HttpError(404, 'Servidor não encontrado.');
     return r;
   }
-  const get = id => fromRow(row(id));
-  const all = () => db.prepare('SELECT * FROM servers ORDER BY name COLLATE NOCASE').all().map(fromRow);
+  const withGeo = srv => { srv.geo = geoip.forServer(srv); return srv; };
+  const get = id => withGeo(fromRow(row(id)));
+  const all = () => db.prepare('SELECT * FROM servers ORDER BY name COLLATE NOCASE').all().map(r => withGeo(fromRow(r)));
 
   return {
     get,
@@ -151,7 +155,8 @@ function create({ db, now, config, features }) {
         return { range: key, ranges: Object.keys(RANGES), points };
       });
     },
-    jobs: [{ name: 'metrics-prune', everyMs: 3600_000, run: () => db.prepare('DELETE FROM metrics WHERE ts < ?').run(now() - config.retentionDays * 86400) }],
+    jobs: [{ name: 'geoip', everyMs: 120_000, runAtStart: true, run: () => geoip.refresh(all()) },
+      { name: 'metrics-prune', everyMs: 3600_000, run: () => db.prepare('DELETE FROM metrics WHERE ts < ?').run(now() - config.retentionDays * 86400) }],
   };
 }
 

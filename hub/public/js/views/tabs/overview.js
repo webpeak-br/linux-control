@@ -1,5 +1,5 @@
 import { api } from '../../api.js';
-import { esc, N, bar, bytes, rate, dt, ago } from '../../util.js';
+import { esc, N, bar, bytes, rate, dt, ago, datacenter, ipPlace, flag } from '../../util.js';
 import { chartsHtml, bindCharts } from '../../chart.js';
 import { fixButtons } from '../../actions.js';
 
@@ -42,6 +42,9 @@ export function body(s) {
         <dt>Hostname</dt><dd>${esc(sys.hostname)}</dd><dt>Sistema</dt><dd>${esc(sys.os)}</dd>
         <dt>Kernel</dt><dd>${esc(sys.kernel)} (${esc(sys.arch)})</dd><dt>CPU</dt><dd>${esc(sys.cpu_model)} · ${N(sys.cores)} núcleos</dd>
         <dt>Memória</dt><dd>${bytes(mem.total)}</dd><dt>Virtualização</dt><dd>${esc(sys.virt)}</dd>
+        <dt>Datacenter</dt><dd>${esc(datacenter(s)) || '<span class="dim">não identificado</span>'}</dd>
+        <dt>Localização do IP</dt><dd>${s.geo ? `${flag(s.geo.country)} ${esc(ipPlace(s))}<div class="dim small">${esc(s.geo.ip)}${s.geo.org ? ` · ${esc(s.geo.org)}` : ''}${s.geo.asn ? ` (${esc(s.geo.asn)})` : ''}</div>
+          ${s.geo.lat != null ? `<a class="small" target="_blank" rel="noopener noreferrer" href="https://www.openstreetmap.org/?mlat=${N(s.geo.lat)}&mlon=${N(s.geo.lon)}#map=10/${N(s.geo.lat)}/${N(s.geo.lon)}">ver no mapa</a>` : ''}` : '<span class="dim">aguardando consulta</span>'}</dd>
         <dt>Fuso horário</dt><dd>${esc(sys.timezone)} ${sys.ntp_synced === true ? '<span class="pill ok">NTP ok</span>' : sys.ntp_synced === false ? '<span class="pill warn">NTP fora</span>' : ''}</dd>
         <dt>Ligado desde</dt><dd>${dt(sys.boot_time)}</dd>
         <dt>IPs</dt><dd>${(sys.ips || []).map(i => `${esc(i.addr)} <span class="dim">(${esc(i.iface)})</span>`).join('<br>') || '—'}</dd>

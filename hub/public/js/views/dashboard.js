@@ -1,6 +1,6 @@
 // Lista de servidores. Busca e filtro ficam fora da área atualizada, então o foco nunca se perde.
 import { api } from '../api.js';
-import { esc, N, bar, dur, ago, ipsOf, STATUS_GROUP } from '../util.js';
+import { esc, N, bar, dur, ago, ipsOf, STATUS_GROUP, datacenter, ipPlace, flag } from '../util.js';
 import { addServerModal } from './add-server.js';
 
 const state = { filter: 'all', search: '' };
@@ -46,6 +46,12 @@ export function dashboardView(root) {
   return { destroy: () => clearInterval(timer) };
 }
 
+function where(s) {
+  const dc = datacenter(s), place = ipPlace(s);
+  if (!dc && !place) return '';
+  return `<div class="srv-where">${s.geo ? flag(s.geo.country) + ' ' : ''}${esc([place, dc].filter(Boolean).join(' — '))}</div>`;
+}
+
 function card(s) {
   const h = s.health, m = s.metrics, lv = s.levels || {};
   const sub = s.system ? `${s.system.hostname} · ${s.system.os}` : 'aguardando agente';
@@ -65,5 +71,5 @@ function card(s) {
   return `<a class="srv ${h.status}" href="#/server/${Number(s.id)}">
     <div class="srv-head"><span class="dot ${h.status}" title="${esc(h.label)}"></span>
       <div class="grow"><div class="srv-name">${esc(s.name)}</div><div class="srv-sub">${esc(sub)}</div></div>
-      <span class="dim small">${esc(ip)}</span></div>${bars}${issues}<div class="srv-foot">${pills.join('')}</div></a>`;
+      <span class="dim small">${esc(ip)}</span></div>${where(s)}${bars}${issues}<div class="srv-foot">${pills.join('')}</div></a>`;
 }

@@ -80,3 +80,12 @@ test('ids de ação com número (fix.fail2ban) passam pelo filtro do catálogo',
   const agent = fs.readFileSync(path.join(__dirname, '../../agent/linux-control-agent.py'), 'utf8');
   for (const [, id] of agent.matchAll(/\{"id": "([a-z0-9_]+\.[a-z0-9_]+)"/g)) assert.ok(re.test(id), id);
 });
+
+test('localização: só IP público é consultado e a resposta é normalizada', () => {
+  const { isPublic, publicIp, clean } = require('../../hub/features/servers/geo');
+  for (const ip of ['10.0.0.1', '192.168.1.5', '172.20.0.1', '127.0.0.1', '100.64.1.1', '::1', 'fe80::1', 'fd00::1']) assert.equal(isPublic(ip), false, ip);
+  assert.ok(isPublic('45.32.94.194'));
+  assert.equal(publicIp({ remote_ip: '10.0.0.9', inventory: { system: { ips: [{ addr: '10.0.0.9/24' }, { addr: '203.0.113.7/24' }] } } }), '203.0.113.7');
+  const g = clean({ city: 'Los Angeles', region: 'California', country: 'us', loc: '34.05,-118.24', org: 'AS20473 The Constant Company, LLC' });
+  assert.deepEqual([g.country, g.asn, g.org, g.lat], ['US', 'AS20473', 'The Constant Company, LLC', 34.05]);
+});

@@ -9,7 +9,7 @@
 //   refreshMs?                 intervalo de atualização (padrão 10 s)
 // ctx oferece rerender() (redesenha com os dados atuais) e reload() (busca de novo).
 import { api } from '../api.js';
-import { esc, ago, dur, ipsOf, STATUS_PILL } from '../util.js';
+import { esc, ago, dur, ipsOf, STATUS_PILL, datacenter, ipPlace, flag } from '../util.js';
 import { bindRunButtons, loadAgentCommands } from '../actions.js';
 import { bindCopy } from '../ui.js';
 import * as overview from './tabs/overview.js';
@@ -38,7 +38,8 @@ export function serverView(root, id, tabName, arg) {
 
   const meta = () => {
     const sys = (server.inventory || {}).system || {}, m = server.metrics || {};
-    return [sys.os, sys.hostname, ipsOf(sys).slice(0, 3).join(', '), server.remote_ip && `IP de saída ${server.remote_ip}`,
+    const place = [server.geo && `${flag(server.geo.country)} ${ipPlace(server)}`, datacenter(server)].filter(Boolean).join(' — ');
+    return [sys.os, sys.hostname, ipsOf(sys).slice(0, 3).join(', '), server.remote_ip && `IP de saída ${server.remote_ip}`, place,
       `atualizado ${ago(server.last_seen)}`, m.uptime && `ligado há ${dur(m.uptime)}`].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join('');
   };
 

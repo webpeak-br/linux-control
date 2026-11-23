@@ -24,6 +24,8 @@ const config = {
   licenseUrl: (env.LCTL_LICENSE_URL ?? pkg.linuxControl.licenseUrl).replace(/\/+$/, ''),
   telemetry: env.LCTL_TELEMETRY !== '0',
   releasesUrl: env.LCTL_RELEASES_URL || pkg.linuxControl.releasesUrl,
+  // Localização do IP dos servidores. LCTL_GEOIP=0 desliga ({ip} é trocado pelo IP consultado).
+  geoipUrl: env.LCTL_GEOIP === '0' ? '' : (env.LCTL_GEOIP_URL || 'https://ipinfo.io/{ip}/json'),
   publicDir: path.join(HUB_DIR, 'public'),
   agentDir: AGENT_DIR,
 };

@@ -33,3 +33,19 @@ export const STATUS_PILL = { ok: 'ok', warn: 'warn', crit: 'crit', offline: 'cri
 export const bar = (pct, level = 'ok') => `<div class="bar"><i class="${level === 'ok' ? '' : esc(level)}" style="width:${Math.min(100, N(pct))}%"></i></div>`;
 
 export const LOGO = `<svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#5a44cd"/><path d="M13 9h6l1.5 16h-9z" fill="#f1f1f1"/><rect x="12.5" y="6" width="7" height="4" rx="1" fill="#e7f727"/><path d="M19.5 7.5 29 4v8z" fill="#e7f727" opacity=".55"/><rect x="9" y="25" width="14" height="2" rx="1" fill="#f1f1f1"/></svg>`;
+
+// Onde o servidor está: datacenter informado pelo provedor (agente) e localização do IP público (hub).
+const COUNTRY = (() => { try { return new Intl.DisplayNames(['pt-BR'], { type: 'region' }); } catch { return null; } })();
+export const countryName = c => { try { return (c && COUNTRY && COUNTRY.of(c)) || c || ''; } catch { return c || ''; } };
+export function datacenter(s) {
+  const c = s.cloud || (s.inventory || {}).cloud;
+  if (!c || !c.provider) return '';
+  const where = [c.region, c.city && c.city !== c.region ? c.city : ''].filter(Boolean).join(' · ');
+  return where ? `${c.provider} · ${where}` : c.provider;
+}
+export function ipPlace(s) {
+  const g = s.geo;
+  if (!g) return '';
+  return [g.city, g.region && g.region !== g.city ? g.region : '', countryName(g.country)].filter(Boolean).join(', ');
+}
+export const flag = c => (/^[A-Z]{2}$/.test(c || '') ? String.fromCodePoint(...[...c].map(x => 0x1f1a5 + x.charCodeAt(0))) : '');

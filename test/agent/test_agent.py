@@ -254,3 +254,25 @@ class CorrecoesDoDiagnostico(unittest.TestCase):
             self.assertEqual(agent.ssh_ports(), {2222})
         self.assertEqual(eff["permitrootlogin"], "yes")
         self.assertEqual(eff["allowusers"], "ana root")
+
+
+class Datacenter(unittest.TestCase):
+    def setUp(self):
+        agent._cloud_cache.clear()
+
+    def test_vultr_pela_regiao_dos_metadados(self):
+        dmi = {"/sys/class/dmi/id/sys_vendor": "Vultr"}
+        meta = '{"region": {"regioncode": "SAO", "countrycode": "BR"}}'
+        with mock.patch.object(agent, "read", side_effect=lambda p, d="": dmi.get(p, "")), \
+             mock.patch.object(agent, "meta_get", return_value=meta):
+            self.assertEqual(agent.cloud_info(), {"provider": "Vultr", "region": "SAO", "city": "São Paulo", "country": "BR"})
+
+    def test_maquina_sem_provedor_conhecido_nao_consulta_a_rede(self):
+        with mock.patch.object(agent, "read", return_value="QEMU"), mock.patch.object(agent, "meta_get") as mg:
+            self.assertIsNone(agent.cloud_info())
+        mg.assert_not_called()
+
+    def test_metadados_fora_do_ar_mantem_o_provedor(self):
+        with mock.patch.object(agent, "read", side_effect=lambda p, d="": "DigitalOcean" if p.endswith("sys_vendor") else ""), \
+             mock.patch.object(agent, "meta_get", side_effect=OSError("timeout")):
+            self.assertEqual(agent.cloud_info(), {"provider": "DigitalOcean"})
