@@ -1,6 +1,6 @@
 {
   "name": "linux-control-hub",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Painel web para monitorar e administrar servidores Linux",
   "main": "server.js",
   "license": "MIT",
