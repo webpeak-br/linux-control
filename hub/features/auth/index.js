@@ -79,6 +79,14 @@ function create({ db, settings, config, net, now, features }) {
 
   return {
     session,
+    // Confirmação de senha para operações sensíveis (abrir terminal), com o mesmo limite de tentativas do login.
+    async confirmPassword(password, ip) {
+      if (limiter.blocked(ip)) throw new HttpError(429, 'Muitas tentativas. Aguarde alguns minutos.');
+      if (!(await verifyPassword(String(password || ''), settings.get('auth.password')))) {
+        limiter.failed(ip);
+        throw new HttpError(403, 'Senha incorreta.');
+      }
+    },
     setPassword,
     announceSetup,
     // Senha vinda do ambiente (instalador/Docker) tem prioridade e é aplicada a cada início.

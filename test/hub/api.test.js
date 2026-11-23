@@ -205,3 +205,67 @@ describe('catálogo com ações de estado', () => {
     assert.equal('done' in by['cleanup.tmp'], false);
   });
 });
+
+describe('terminal', () => {
+  let hub, srv;
+  const agentCall = (method, url, body) => hub.call(method, url, { body, headers: { Authorization: `Bearer ${srv.token}` }, csrf: false });
+  before(async () => { hub = await startHub(); await setupAdmin(hub); srv = await enrollServer(hub); });
+  after(() => hub.stop());
+
+  test('exige o agente no modo admin e a senha do painel', async () => {
+    let r = await hub.call('POST', `/api/servers/${srv.id}/terminal`, { body: { password: 'senha-de-teste-1' } });
+    assert.equal(r.status, 400);
+    await srv.report({ agent_version: '0', metrics: metrics(), results: [], inventory: { system: {}, actions: [], actions_mode: 'admin' } });
+    r = await hub.call('POST', `/api/servers/${srv.id}/terminal`, { body: { password: 'errada' } });
+    assert.equal(r.status, 403);
+  });
+
+  test('fluxo completo: agente recebe a sessão, a entrada e devolve a saída para o navegador e para a gravação', async () => {
+    const opened = await hub.call('POST', `/api/servers/${srv.id}/terminal`, { body: { password: 'senha-de-teste-1', cols: 100, rows: 30 } });
+    assert.equal(opened.status, 200);
+    const sid = opened.body.id;
+    const rep = await srv.report({ agent_version: '0', metrics: metrics(), results: [] });
+    assert.deepEqual(rep.body.terminals, [{ id: sid }]);
+
+    // Primeira busca do agente: recebe o tamanho da janela.
+    let inp = await agentCall('GET', `/api/agent/terminal/${sid}/in`);
+    assert.deepEqual(inp.body.resize, { cols: 100, rows: 30 });
+
+    // O navegador digita; a busca seguinte do agente (já esperando) recebe na hora.
+    const waiting = agentCall('GET', `/api/agent/terminal/${sid}/in`);
+    await hub.call('POST', `/api/terminal/${sid}/input`, { body: { data: 'ls\r' } });
+    inp = await waiting;
+    assert.equal(Buffer.from(inp.body.data[0], 'base64').toString(), 'ls\r');
+
+    // O navegador acompanha pelo SSE.
+    const ctrl = new AbortController();
+    const cookie = await hub.call('GET', '/api/me');   // garante sessão ativa
+    assert.equal(cookie.status, 200);
+    const stream = await fetch(`${hub.base}/api/terminal/${sid}/stream`, { headers: { Cookie: hub.cookie() }, signal: ctrl.signal });
+    const reader = stream.body.getReader();
+    await agentCall('POST', `/api/agent/terminal/${sid}/out`, { data: [Buffer.from('arquivo.txt\r\n').toString('base64')] });
+    let got = '';
+    while (!got.includes('event: out')) got += new TextDecoder().decode((await reader.read()).value);
+    assert.match(got, /YXJxdWl2by50eHQNCg==/);
+    ctrl.abort();
+
+    // Fechar grava na auditoria e a gravação contém a saída.
+    await hub.call('DELETE', `/api/terminal/${sid}`);
+    const rec = await hub.call('GET', '/api/terminal/recordings');
+    const name = rec.body.recordings[0].name;
+    assert.equal((await hub.call('POST', `/api/terminal/recordings/${name}`, { body: { password: 'errada' } })).status, 403);
+    const file = await hub.call('POST', `/api/terminal/recordings/${name}`, { body: { password: 'senha-de-teste-1' } });
+    assert.match(file.body, /arquivo\.txt/);
+    const audit = (await hub.call('GET', '/api/audit')).body.events.map(e => e.event);
+    assert.ok(audit.includes('terminal_aberto') && audit.includes('terminal_fechado'));
+  });
+
+  test('agente de outro servidor não acessa a sessão', async () => {
+    await srv.report({ agent_version: '0', metrics: metrics(), results: [], inventory: { system: {}, actions: [], actions_mode: 'admin' } });
+    const sid = (await hub.call('POST', `/api/servers/${srv.id}/terminal`, { body: { password: 'senha-de-teste-1' } })).body.id;
+    const other = await enrollServer(hub, 'outro');
+    const r = await hub.call('GET', `/api/agent/terminal/${sid}/in`, { headers: { Authorization: `Bearer ${other.token}` }, csrf: false });
+    assert.equal(r.status, 404);
+    await hub.call('DELETE', `/api/terminal/${sid}`);
+  });
+});

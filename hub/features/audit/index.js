@@ -11,6 +11,7 @@ const EVENTS = {
   token_regenerado: 'Token regenerado', alertas_configurados: 'Alertas configurados',
   atualizacao_hub: 'Atualização do painel', atualizacao_agente: 'Atualização de agente',
   chave_ssh_cadastrada: 'Chave SSH cadastrada', chave_ssh_removida: 'Chave SSH removida',
+  terminal_aberto: 'Terminal aberto', terminal_fechado: 'Terminal fechado', terminal_gravacao_baixada: 'Gravação de terminal baixada',
 };
 
 function create({ db, now }) {

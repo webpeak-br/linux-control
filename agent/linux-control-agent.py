@@ -10,21 +10,28 @@ Uso:
   linux-control-agent.py --once     coleta tudo e imprime o JSON (não envia)
   linux-control-agent.py --test     coleta e envia uma única vez
 """
+import base64
 import calendar
+import fcntl
 import glob
 import hashlib
 import json
 import os
 import platform
+import pty
 import pwd
 import queue
+import select
+import struct
 import re
 import shutil
+import signal
 import stat
 import socket
 import ssl
 import subprocess
 import sys
+import termios
 import threading
 import time
 from urllib import error as urlerror
@@ -1582,6 +1589,979 @@ def run_authorize_key(p, state):
     return 0, "%s: %s" % (pw.pw_name, install_ssh_key(pw, p["ssh_key"]))
 
 
+# ---------------------------------------------------------------- aplicativos de 1 clique
+#
+# Cada aplicativo web vira uma "stack" Docker Compose em /opt/linux-control/stacks/<nome>/, com um .env (0600)
+# de senhas geradas aqui. Um Caddy compartilhado (container lctl-proxy, rede "lctl") recebe as portas 80/443 e
+# emite o HTTPS de cada domínio. O compose da receita fica como veio; o que o painel precisa (rede do proxy,
+# apelido, porta sem domínio) vai num arquivo de override em JSON, que o Compose aceita como YAML.
+# Receitas nativas (LAMP, painéis de hospedagem) rodam o comando de instalação documentado e só ficam registradas.
+
+STACKS_DIR = "/opt/linux-control/stacks"
+PROXY_DIR = "/opt/linux-control/proxy"
+PROXY_IMAGE = "caddy:2.8.4-alpine"
+STACK_NAME_RE = r"^[a-z0-9][a-z0-9-]{1,40}$"
+DOMAIN_RE = r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+EMAIL_RE = r"^[^@\s\r\n]{1,64}@[^@\s\r\n]{1,190}\.[A-Za-z]{2,24}$"
+APP_RECIPES = []          # preenchido pelo bloco de receitas mais abaixo
+APP_BY_ID = {}
+
+
+def compose_cmd():
+    if run(["docker", "compose", "version"], timeout=20, merge=False)[0] == 0:
+        return ["docker", "compose"]
+    return ["docker-compose"] if which("docker-compose") else None
+
+
+def stack_meta(name):
+    try:
+        with open(os.path.join(STACKS_DIR, name, "stack.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def stacks_status():
+    res = []
+    if not os.path.isdir(STACKS_DIR):
+        return res
+    cc = compose_cmd() if which("docker") else None
+    for name in sorted(os.listdir(STACKS_DIR)):
+        meta = stack_meta(name)
+        if not meta or not re.fullmatch(STACK_NAME_RE, name):
+            continue
+        state = "native"
+        if meta.get("kind") == "docker" and cc:
+            rc, out = run(cc + ["-p", name, "ps", "--format", "json"], timeout=30, merge=False)
+            running = 0
+            for line in out.strip().splitlines():
+                try:
+                    items = json.loads(line)
+                except ValueError:
+                    continue
+                for it in items if isinstance(items, list) else [items]:
+                    running += 1 if str(it.get("State", "")).lower() == "running" else 0
+            state = "running" if running else "stopped"
+        res.append({"name": name, "app": meta.get("app"), "label": meta.get("label"), "url": meta.get("url"), "kind": meta.get("kind"),
+                    "created": meta.get("created"), "key": name, "state": [state, meta.get("kind", "docker")]})
+    return res
+
+
+def app_catalog():
+    """O que o painel mostra na vitrine: sem comandos nem compose, só a descrição e o formulário."""
+    keys = ("id", "label", "category", "desc", "kind", "license", "license_note", "min_ram_mb", "min_disk_gb", "os",
+            "dedicated_server", "needs_domain", "fields", "post_install", "official_docs", "risk_notes")
+    return [{k: r[k] for k in keys if k in r} for r in APP_RECIPES]
+
+
+def render_tpl(text, values):
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: str(values.get(m.group(1), "")), text)
+
+
+def gen_secret(n=24):
+    alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(alphabet[b % len(alphabet)] for b in os.urandom(n))
+
+
+def write_private(path, content, mode=0o600):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+
+
+def port_busy(port):
+    return any(r["port"] == port and r["proto"].startswith("tcp") for r in ports())
+
+
+def proxy_container_running():
+    rc, out = run(["docker", "inspect", "-f", "{{.State.Running}}", "lctl-proxy"], timeout=20, merge=False)
+    return rc == 0 and out.strip() == "true"
+
+
+def ensure_proxy(cc, email):
+    """Sobe o Caddy compartilhado (uma vez) e recarrega a configuração a partir de sites/*.caddy."""
+    os.makedirs(os.path.join(PROXY_DIR, "sites"), exist_ok=True)
+    global_opts = "{\n\temail %s\n}\n\n" % email if email else ""
+    write_private(os.path.join(PROXY_DIR, "Caddyfile"), global_opts + "import /etc/caddy/sites/*.caddy\n", 0o644)
+    compose = {"services": {"proxy": {
+        "image": PROXY_IMAGE, "container_name": "lctl-proxy", "restart": "unless-stopped",
+        "ports": ["80:80", "443:443", "443:443/udp"],
+        "volumes": ["./Caddyfile:/etc/caddy/Caddyfile:ro", "./sites:/etc/caddy/sites:ro", "caddy_data:/data", "caddy_config:/config"],
+        "networks": ["lctl"]}},
+        "volumes": {"caddy_data": {}, "caddy_config": {}}, "networks": {"lctl": {"external": True}}}
+    write_private(os.path.join(PROXY_DIR, "docker-compose.json"), json.dumps(compose, indent=2), 0o644)
+    if proxy_container_running():
+        return run(["docker", "exec", "lctl-proxy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], timeout=60)
+    busy = [p for p in (80, 443) if port_busy(p)]
+    if busy:
+        return 1, ("As portas %s já estão em uso por outro servidor web (Nginx/Apache?). Instale sem domínio "
+                   "(o app fica numa porta própria) ou libere as portas 80/443." % ", ".join(map(str, busy)))
+    return run(cc + ["-p", "lctl-proxy", "-f", os.path.join(PROXY_DIR, "docker-compose.json"), "up", "-d"], timeout=600)
+
+
+def run_stack_install(p, state):
+    app = APP_BY_ID.get(p["app"])
+    if not app:
+        return 1, "Aplicativo desconhecido: %s" % p["app"]
+    try:
+        extra = json.loads(p.get("options") or "{}")
+    except ValueError:
+        return 2, "Opções inválidas."
+    domain = (p.get("domain") or "").lower()
+    email = p.get("email") or ""
+    if app.get("needs_domain") and not domain and app.get("kind") != "docker":
+        return 2, "Este aplicativo precisa de um domínio apontado para o servidor."
+    values = {"domain": domain, "email": email}
+    for f in app.get("fields", []):
+        v = str(extra.get(f["name"], "")).strip()
+        if not v and f.get("required", True):
+            return 2, "Preencha: %s" % f["label"]
+        if v and f.get("pattern") and not re.fullmatch(f["pattern"], v):
+            return 2, "Valor inválido em %s" % f["label"]
+        # Campos entram em comandos de instalação: sem padrão próprio, só caracteres seguros.
+        if "\n" in v or "\r" in v or (v and not f.get("pattern") and not re.fullmatch(r"[A-Za-z0-9@._+:/-]{1,200}", v)):
+            return 2, "Valor inválido em %s" % f["label"]
+        values[f["name"]] = v
+    for s in app.get("secrets", []):
+        values[s] = gen_secret()
+    ram = int(safe(lambda: os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), 0) / 1048576)
+    warn = ""
+    if app.get("min_ram_mb") and ram and ram < app["min_ram_mb"]:
+        warn = "Atenção: o servidor tem %d MB de RAM; %s recomenda %d MB.\n" % (ram, app["label"], app["min_ram_mb"])
+
+    if app.get("kind") != "docker":
+        name = app["id"]
+        os.makedirs(os.path.join(STACKS_DIR, name), exist_ok=True)
+        rc, out = run(["/bin/bash", "-c", render_tpl(app["install_cmd"], values)], timeout=int(app.get("timeout", 3600)))
+        if rc == 0:
+            write_private(os.path.join(STACKS_DIR, name, "stack.json"), json.dumps({
+                "app": app["id"], "label": app["label"], "kind": app.get("kind"), "created": int(time.time()), "url": render_tpl(app.get("url", ""), values)}))
+        state["force_inventory"] = True
+        return rc, warn + out[-30000:] + ("\n\n" + app.get("post_install", "") if rc == 0 else "")
+
+    if not which("docker"):
+        rc, out = run_app(False)({"app": "docker"}, state)
+        if rc != 0:
+            return rc, "Não consegui instalar o Docker:\n" + out[-4000:]
+    cc = compose_cmd()
+    if not cc:
+        return 1, "Docker Compose não encontrado (instale docker-compose-v2 ou o plugin compose)."
+    base = re.sub(r"[^a-z0-9-]", "-", (domain.split(".")[0] if domain else app["id"]))[:30].strip("-") or app["id"]
+    name = base
+    i = 2
+    while os.path.exists(os.path.join(STACKS_DIR, name)):
+        name = "%s-%d" % (base, i)
+        i += 1
+    d = os.path.join(STACKS_DIR, name)
+    os.makedirs(d, mode=0o700)
+    env = "".join("%s=%s\n" % (k, render_tpl(str(v), values).replace("\n", "")) for k, v in app.get("env", {}).items())
+    write_private(os.path.join(d, ".env"), env)
+    write_private(os.path.join(d, "docker-compose.yml"), app["compose"], 0o644)
+    svc, port = app["proxy"]["service"], int(app["proxy"]["port"])
+    alias = "%s-web" % name
+    override = {"services": {svc: {"networks": {"default": {}, "lctl": {"aliases": [alias]}}}}, "networks": {"lctl": {"external": True}}}
+    host_port = None
+    if not domain:
+        host_port = next(x for x in range(8080, 8999) if not port_busy(x))
+        override["services"][svc]["ports"] = ["%d:%d" % (host_port, port)]
+    write_private(os.path.join(d, "lctl.override.json"), json.dumps(override, indent=2), 0o644)
+    run(["docker", "network", "create", "lctl"], timeout=30)
+    files = ["-p", name, "-f", os.path.join(d, "docker-compose.yml"), "-f", os.path.join(d, "lctl.override.json")]
+    rc, out = run(cc + files + ["up", "-d"], timeout=1800)
+    if rc != 0:
+        return rc, warn + "Falha ao subir %s:\n%s\n\nA pasta %s ficou para inspeção; remova pelo painel." % (app["label"], out[-8000:], d)
+    if app.get("post_up_cmd"):
+        # Configuração inicial documentada pelo fornecedor (ex.: instalação automática do Mautic).
+        time.sleep(20)
+        prc, pout = run(["/bin/bash", "-c", "cd %s && %s" % (d, render_tpl(app["post_up_cmd"], values))], timeout=1800,
+                        env=dict(os.environ, COMPOSE_PROJECT_NAME=name, COMPOSE_FILE="docker-compose.yml:lctl.override.json"))
+        out += "\n\nConfiguração inicial:\n" + pout[-4000:]
+        if prc != 0:
+            out += "\n(a configuração inicial falhou; termine pelo navegador)"
+    url = ""
+    if domain:
+        os.makedirs(os.path.join(PROXY_DIR, "sites"), exist_ok=True)
+        write_private(os.path.join(PROXY_DIR, "sites", "%s.caddy" % name), "%s {\n\treverse_proxy %s:%d\n}\n" % (domain, alias, port), 0o644)
+        prc, pout = ensure_proxy(cc, email)
+        if prc != 0:
+            out += "\n\nProxy HTTPS: " + pout
+        url = "https://%s" % domain
+    else:
+        ip = next((i["addr"] for i in system_info().get("ips", []) if not i["addr"].startswith(("10.", "172.", "192.168."))), "IP-DO-SERVIDOR")
+        url = "http://%s:%d" % (ip.split("/")[0], host_port)
+    write_private(os.path.join(d, "stack.json"), json.dumps({"app": app["id"], "label": app["label"], "kind": "docker", "domain": domain,
+                                                              "url": url, "created": int(time.time()), "host_port": host_port}))
+    state["force_inventory"] = True
+    tips = "\n".join(filter(None, [warn.strip(), "%s instalado: %s" % (app["label"], url),
+                                   "Aponte o DNS de %s para este servidor antes (o HTTPS é emitido na primeira visita)." % domain if domain else
+                                   "Sem domínio: o acesso é por HTTP na porta %d (libere no firewall se precisar)." % host_port,
+                                   "Senhas geradas: %s/.env (só root lê)." % d if app.get("secrets") else "",
+                                   render_tpl(app.get("post_install", ""), values)]))
+    return 0, tips + "\n\n" + out[-4000:]
+
+
+def stack_dir(name):
+    if not re.fullmatch(STACK_NAME_RE, name or "") or not stack_meta(name):
+        return None
+    return os.path.join(STACKS_DIR, name)
+
+
+def run_stack(verb):
+    def fn(p, state):
+        d = stack_dir(p["name"])
+        if not d:
+            return 1, "Aplicativo %s não encontrado." % p["name"]
+        meta = stack_meta(p["name"])
+        if meta.get("kind") != "docker":
+            return 1, "%s foi instalado direto no sistema; gerencie pelos serviços dele." % meta.get("label")
+        cc = compose_cmd()
+        files = ["-p", p["name"], "-f", os.path.join(d, "docker-compose.yml"), "-f", os.path.join(d, "lctl.override.json")]
+        if verb == "logs":
+            return run(cc + files + ["logs", "--no-color", "--tail", "300"], timeout=60)
+        if verb == "remove":
+            rc, out = run(cc + files + ["down"] + (["-v"] if p.get("remove_data") else []), timeout=600)
+            if rc != 0:
+                return rc, out
+            site = os.path.join(PROXY_DIR, "sites", "%s.caddy" % p["name"])
+            if os.path.exists(site):
+                os.remove(site)
+                if proxy_container_running():
+                    run(["docker", "exec", "lctl-proxy", "caddy", "reload", "--config", "/etc/caddy/Caddyfile"], timeout=60)
+            if p.get("remove_data"):
+                shutil.rmtree(d)
+                out += "\nPasta e volumes apagados."
+            else:
+                os.rename(os.path.join(d, "stack.json"), os.path.join(d, "stack.removed.json"))
+                out += "\nContainers removidos; dados preservados nos volumes e em %s." % d
+            state["force_inventory"] = True
+            return 0, out
+        state["force_inventory"] = True
+        return run(cc + files + ([verb] if verb != "start" else ["up", "-d"]), timeout=600)
+    return fn
+
+
+# Receitas pesquisadas na documentação oficial de cada projeto (versões fixas). Revise ao atualizar versões.
+APP_RECIPES[:] = json.loads(r'''[
+ {
+  "id": "wordpress",
+  "label": "WordPress",
+  "category": "Sites e lojas",
+  "desc": "CMS mais usado do mundo para sites, blogs e lojas (com WooCommerce).",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "Software livre (GPLv2).",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "db_password",
+   "db_root_password"
+  ],
+  "compose": "services:\n  app:\n    image: wordpress:7.1.5-php8.4-apache\n    restart: unless-stopped\n    depends_on:\n      - db\n    environment:\n      WORDPRESS_DB_HOST: db:3306\n      WORDPRESS_DB_NAME: wordpress\n      WORDPRESS_DB_USER: wordpress\n      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}\n    volumes:\n      - wp_data:/var/www/html\n    networks:\n      - lctl\n      - db\n  db:\n    image: mariadb:11.8.9\n    restart: unless-stopped\n    environment:\n      MARIADB_DATABASE: wordpress\n      MARIADB_USER: wordpress\n      MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD}\n      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}\n    volumes:\n      - db_data:/var/lib/mysql\n    networks:\n      - db\nvolumes:\n  wp_data:\n  db_data:\nnetworks:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "WORDPRESS_DB_PASSWORD": "{{db_password}}",
+   "MARIADB_ROOT_PASSWORD": "{{db_root_password}}",
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "app",
+   "port": 80
+  },
+  "post_install": "Abrir https://{{domain}} e concluir o assistente (idioma, título do site, usuário e senha do administrador). Depois acessar https://{{domain}}/wp-admin.",
+  "official_docs": "https://hub.docker.com/_/wordpress",
+  "risk_notes": "A imagem oficial (wp-config-docker.php) já reconhece X-Forwarded-Proto=https do proxy. Até concluir o assistente, quem abrir o domínio primeiro cria o administrador: conclua logo após instalar. Tag 7.1.5 = estável atual em 23/11/2026."
+ },
+ {
+  "id": "lamp",
+  "label": "LAMP (Apache + MariaDB + PHP)",
+  "category": "Sites e lojas",
+  "desc": "Pilha clássica Apache, MariaDB e PHP instalada direto no sistema para hospedar sites PHP.",
+  "kind": "native",
+  "license": "grátis",
+  "license_note": "Pacotes livres das distribuições.",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "debian-12",
+   "almalinux-9"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "set -euo pipefail; . /etc/os-release; if command -v apt-get >/dev/null; then\n  export DEBIAN_FRONTEND=noninteractive\n  apt-get update\n  apt-get install -y apache2 mariadb-server mariadb-client php libapache2-mod-php php-mysql php-cli php-curl php-gd php-mbstring php-xml php-zip php-intl php-bcmath php-soap php-opcache unzip\n  a2enmod rewrite headers ssl\n  systemctl enable --now apache2 mariadb\n  systemctl restart apache2\nelif command -v dnf >/dev/null; then\n  dnf install -y httpd mod_ssl mariadb-server php php-cli php-fpm php-mysqlnd php-gd php-mbstring php-xml php-intl php-bcmath php-soap php-opcache php-pdo unzip\n  systemctl enable --now httpd mariadb php-fpm\n  if systemctl is-active --quiet firewalld; then firewall-cmd --permanent --add-service=http --add-service=https; firewall-cmd --reload; fi\nelse\n  echo \"Sistema não suportado\" >&2; exit 1\nfi\nmariadb -e \"DROP USER IF EXISTS ''@'localhost'; DROP USER IF EXISTS ''@'$(hostname)'; DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\\\_%'; FLUSH PRIVILEGES;\"\nphp -v\n",
+  "post_install": "Colocar os arquivos do site em /var/www/html. Criar banco e usuário: mariadb -e \"CREATE DATABASE app; CREATE USER 'app'@'localhost' IDENTIFIED BY 'senha'; GRANT ALL ON app.* TO 'app'@'localhost';\". Para HTTPS, instalar certificado (ex.: certbot --apache).",
+  "official_docs": "https://ubuntu.com/server/docs/how-to-install-and-configure-php ; https://httpd.apache.org/docs/2.4/ ; https://mariadb.com/docs/server/",
+  "risk_notes": "Ocupa as portas 80/443 do host e CONFLITA com o proxy Caddy (lctl-proxy): usar só em servidor sem apps Docker do painel (por isso dedicated_server=true). PHP na versão da distribuição (Ubuntu 22.04=8.1, 24.04=8.3, Debian 12=8.2, Alma 9=8.0 no AppStream padrão). Root do MariaDB fica com autenticação unix_socket (só root local, sem senha). php-zip/php-imagick não estão no AppStream do Alma 9 (precisam EPEL/Remi), por isso não são instalados lá. Sem desinstalação automática; em RHEL altera o firewalld."
+ },
+ {
+  "id": "lemp",
+  "label": "LEMP (Nginx + MariaDB + PHP-FPM)",
+  "category": "Sites e lojas",
+  "desc": "Pilha Nginx, MariaDB e PHP-FPM instalada direto no sistema, leve e rápida para sites PHP.",
+  "kind": "native",
+  "license": "grátis",
+  "license_note": "Pacotes livres das distribuições.",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "debian-12",
+   "almalinux-9"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "set -euo pipefail; . /etc/os-release; if command -v apt-get >/dev/null; then\n  export DEBIAN_FRONTEND=noninteractive\n  apt-get update\n  apt-get install -y nginx mariadb-server mariadb-client php-fpm php-mysql php-cli php-curl php-gd php-mbstring php-xml php-zip php-intl php-bcmath php-soap php-opcache unzip\n  PHPV=$(php -r 'echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;')\n  cat > /etc/nginx/sites-available/default <<EOF\nserver {\n    listen 80 default_server;\n    listen [::]:80 default_server;\n    root /var/www/html;\n    index index.php index.html;\n    server_name _;\n    location / { try_files \\$uri \\$uri/ /index.php?\\$args; }\n    location ~ \\.php\\$ {\n        include snippets/fastcgi-php.conf;\n        fastcgi_pass unix:/run/php/php${PHPV}-fpm.sock;\n    }\n    location ~ /\\.ht { deny all; }\n}\nEOF\n  systemctl enable --now nginx mariadb php${PHPV}-fpm\n  nginx -t && systemctl reload nginx\nelif command -v dnf >/dev/null; then\n  dnf install -y nginx mariadb-server php-fpm php-cli php-mysqlnd php-gd php-mbstring php-xml php-intl php-bcmath php-soap php-opcache php-pdo unzip\n  sed -i 's/^user = apache/user = nginx/; s/^group = apache/group = nginx/' /etc/php-fpm.d/www.conf\n  systemctl enable --now nginx mariadb php-fpm\n  if systemctl is-active --quiet firewalld; then firewall-cmd --permanent --add-service=http --add-service=https; firewall-cmd --reload; fi\nelse\n  echo \"Sistema não suportado\" >&2; exit 1\nfi\nmariadb -e \"DROP USER IF EXISTS ''@'localhost'; DROP USER IF EXISTS ''@'$(hostname)'; DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\\\_%'; FLUSH PRIVILEGES;\"\nphp -v\n",
+  "post_install": "Colocar os arquivos em /var/www/html (Debian/Ubuntu) ou /usr/share/nginx/html (Alma). Criar banco e usuário no MariaDB. Para HTTPS, usar certbot --nginx.",
+  "official_docs": "https://nginx.org/en/docs/ ; https://www.php.net/manual/en/install.fpm.php ; https://mariadb.com/docs/server/",
+  "risk_notes": "Ocupa as portas 80/443 do host e CONFLITA com o proxy Caddy (lctl-proxy). Sobrescreve /etc/nginx/sites-available/default em Debian/Ubuntu. Em Alma, o PHP-FPM passa a rodar como usuário nginx (o pacote nginx do Alma já inclui o handler PHP-FPM em /etc/nginx/default.d/php.conf). PHP na versão da distribuição. Sem desinstalação automática."
+ },
+ {
+  "id": "n8n",
+  "label": "n8n",
+  "category": "Automação",
+  "desc": "Plataforma de automação de fluxos com centenas de integrações e nós de IA.",
+  "kind": "docker",
+  "license": "freemium",
+  "license_note": "Sustainable Use License (fair-code): uso interno grátis; recursos Enterprise exigem licença paga.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [
+   {
+    "name": "timezone",
+    "label": "Fuso horário",
+    "type": "text",
+    "pattern": "^[A-Za-z_]+(/[A-Za-z_+-]+)*$",
+    "required": false,
+    "default": "America/Sao_Paulo"
+   }
+  ],
+  "secrets": [
+   "db_password",
+   "encryption_key"
+  ],
+  "compose": "services:\n  app:\n    image: docker.n8n.io/n8nio/n8n:2.48.8\n    restart: unless-stopped\n    depends_on:\n      - postgres\n    environment:\n      N8N_HOST: ${DOMAIN}\n      N8N_PORT: \"5678\"\n      N8N_PROTOCOL: https\n      N8N_PROXY_HOPS: \"1\"\n      N8N_EDITOR_BASE_URL: https://${DOMAIN}/\n      N8N_WEBHOOK_URL: https://${DOMAIN}/\n      WEBHOOK_URL: https://${DOMAIN}/\n      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}\n      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: \"true\"\n      NODE_ENV: production\n      GENERIC_TIMEZONE: ${TZ}\n      TZ: ${TZ}\n      DB_TYPE: postgresdb\n      DB_POSTGRESDB_HOST: postgres\n      DB_POSTGRESDB_PORT: \"5432\"\n      DB_POSTGRESDB_DATABASE: n8n\n      DB_POSTGRESDB_USER: n8n\n      DB_POSTGRESDB_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - n8n_data:/home/node/.n8n\n    networks:\n      - lctl\n      - db\n  postgres:\n    image: postgres:17.12\n    restart: unless-stopped\n    environment:\n      POSTGRES_DB: n8n\n      POSTGRES_USER: n8n\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - pg_data:/var/lib/postgresql/data\n    networks:\n      - db\nvolumes:\n  n8n_data:\n  pg_data:\nnetworks:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}",
+   "DB_PASSWORD": "{{db_password}}",
+   "N8N_ENCRYPTION_KEY": "{{encryption_key}}",
+   "TZ": "{{timezone}}"
+  },
+  "proxy": {
+   "service": "app",
+   "port": 5678
+  },
+  "post_install": "Abrir https://{{domain}} e criar a conta de proprietário (owner). Guardar o N8N_ENCRYPTION_KEY do .env junto com o backup: sem ele as credenciais salvas ficam ilegíveis.",
+  "official_docs": "https://docs.n8n.io/hosting/installation/server-setups/docker-compose/ ; https://docs.n8n.io/hosting/configuration/environment-variables/database/",
+  "risk_notes": "2.48.8 = canal 'stable' em 23/11/2026 (2.49.x está como 'next/beta'). Desde a 2.30 a variável oficial é N8N_WEBHOOK_URL; WEBHOOK_URL mantida por compatibilidade. O exemplo oficial de Docker usa SQLite; o bloco Postgres segue as variáveis DB_POSTGRESDB_* da doc de banco. RAM mínima não consta na doc: 2 GB é estimativa (NÃO CONFIRMADO). Até criar o owner, o primeiro visitante vira administrador."
+ },
+ {
+  "id": "mautic",
+  "label": "Mautic",
+  "category": "Marketing e CRM",
+  "desc": "Automação de marketing open source: e-mail, landing pages, formulários, segmentação e lead scoring.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "Software livre (GPLv3).",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [
+   {
+    "name": "admin_email",
+    "label": "E-mail do administrador",
+    "type": "text",
+    "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+    "required": true
+   }
+  ],
+  "secrets": [
+   "db_password",
+   "db_root_password",
+   "admin_password"
+  ],
+  "compose": "services:\n  app:\n    image: mautic/mautic:7.2.2-apache\n    restart: unless-stopped\n    environment:\n      DOCKER_MAUTIC_ROLE: mautic_web\n      MAUTIC_DB_HOST: db\n      MAUTIC_DB_PORT: \"3306\"\n      MAUTIC_DB_DATABASE: mautic\n      MAUTIC_DB_USER: mautic\n      MAUTIC_DB_PASSWORD: ${DB_PASSWORD}\n      MAUTIC_MESSENGER_DSN_EMAIL: doctrine://default\n      MAUTIC_MESSENGER_DSN_HIT: doctrine://default\n      PHP_INI_VALUE_DATE_TIMEZONE: America/Sao_Paulo\n    volumes:\n      - mautic_config:/var/www/html/config\n      - mautic_logs:/var/www/html/var/logs\n      - mautic_files:/var/www/html/docroot/media/files\n      - mautic_images:/var/www/html/docroot/media/images\n    depends_on:\n      db:\n        condition: service_healthy\n    healthcheck:\n      test: [\"CMD\", \"curl\", \"-fs\", \"-o\", \"/dev/null\", \"http://localhost\"]\n      interval: 10s\n      timeout: 5s\n      retries: 60\n      start_period: 30s\n    networks:\n      - lctl\n      - db\n  mautic_cron:\n    image: mautic/mautic:7.2.2-apache\n    restart: unless-stopped\n    environment:\n      DOCKER_MAUTIC_ROLE: mautic_cron\n      MAUTIC_DB_HOST: db\n      MAUTIC_DB_PORT: \"3306\"\n      MAUTIC_DB_DATABASE: mautic\n      MAUTIC_DB_USER: mautic\n      MAUTIC_DB_PASSWORD: ${DB_PASSWORD}\n      MAUTIC_MESSENGER_DSN_EMAIL: doctrine://default\n      MAUTIC_MESSENGER_DSN_HIT: doctrine://default\n      PHP_INI_VALUE_DATE_TIMEZONE: America/Sao_Paulo\n    volumes:\n      - mautic_config:/var/www/html/config\n      - mautic_logs:/var/www/html/var/logs\n      - mautic_files:/var/www/html/docroot/media/files\n      - mautic_images:/var/www/html/docroot/media/images\n    depends_on:\n      app:\n        condition: service_healthy\n    networks:\n      - default\n      - db\n  mautic_worker:\n    image: mautic/mautic:7.2.2-apache\n    restart: unless-stopped\n    environment:\n      DOCKER_MAUTIC_ROLE: mautic_worker\n      MAUTIC_DB_HOST: db\n      MAUTIC_DB_PORT: \"3306\"\n      MAUTIC_DB_DATABASE: mautic\n      MAUTIC_DB_USER: mautic\n      MAUTIC_DB_PASSWORD: ${DB_PASSWORD}\n      MAUTIC_MESSENGER_DSN_EMAIL: doctrine://default\n      MAUTIC_MESSENGER_DSN_HIT: doctrine://default\n      PHP_INI_VALUE_DATE_TIMEZONE: America/Sao_Paulo\n    volumes:\n      - mautic_config:/var/www/html/config\n      - mautic_logs:/var/www/html/var/logs\n      - mautic_files:/var/www/html/docroot/media/files\n      - mautic_images:/var/www/html/docroot/media/images\n    depends_on:\n      app:\n        condition: service_healthy\n    networks:\n      - default\n      - db\n  db:\n    image: mysql:8.4.13\n    restart: unless-stopped\n    environment:\n      MYSQL_DATABASE: mautic\n      MYSQL_USER: mautic\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}\n    volumes:\n      - mysql_data:/var/lib/mysql\n    healthcheck:\n      test: mysqladmin --user=$$MYSQL_USER --password=$$MYSQL_PASSWORD ping\n      interval: 5s\n      timeout: 5s\n      retries: 30\n      start_period: 10s\n    networks:\n      - db\nvolumes:\n  mysql_data:\n  mautic_config:\n  mautic_logs:\n  mautic_files:\n  mautic_images:\nnetworks:\n  default:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DB_PASSWORD": "{{db_password}}",
+   "DB_ROOT_PASSWORD": "{{db_root_password}}",
+   "DOMAIN": "{{domain}}",
+   "ADMIN_EMAIL": "{{admin_email}}",
+   "ADMIN_PASSWORD": "{{admin_password}}"
+  },
+  "proxy": {
+   "service": "app",
+   "port": 80
+  },
+  "post_up_cmd": "docker compose exec -T --user www-data --workdir /var/www/html app php ./bin/console mautic:install \"https://{{domain}}\" --admin_email=\"{{admin_email}}\" --admin_password=\"{{admin_password}}\"",
+  "post_install": "Entrar em https://{{domain}} com o e-mail informado e a senha gerada (ADMIN_PASSWORD no .env). Se o painel não rodar o post_up_cmd, o instalador web aparece no primeiro acesso. Depois configurar o envio de e-mail (SMTP/SES) em Configurações > E-mail.",
+  "official_docs": "https://github.com/mautic/docker-mautic ; https://docs.mautic.org/en/7.x/",
+  "risk_notes": "Versão estável atual é a 7.2.2 (se exigirem a 5, existe 5.2.12-apache, ainda com correções). Banco MySQL 8.4 LTS, como no exemplo oficial (mysql:lts). O post_up_cmd (campo extra: rodar na pasta da stack após o primeiro 'up', quando o app estiver saudável) usa o comando de instalação documentado no README do docker-mautic. Gerar ADMIN_PASSWORD só com letras e números. Atrás de proxy pode ser preciso cadastrar o proxy em Configurações > Sistema > 'Trusted proxies' para URLs https corretas: NÃO CONFIRMADO via variável de ambiente."
+ },
+ {
+  "id": "openclaw",
+  "label": "OpenClaw (ex-Moltbot/Clawdbot)",
+  "category": "Inteligência artificial",
+  "desc": "Assistente pessoal de IA no seu servidor, que conversa por WhatsApp, Telegram, Discord e outros canais.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "Código aberto (MIT). Exige chave de um provedor de IA (OpenAI, Anthropic etc., pagos por uso) ou modelo local.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 10,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [
+   {
+    "name": "openai_api_key",
+    "label": "Chave de API da OpenAI",
+    "type": "password",
+    "pattern": "^sk-[A-Za-z0-9_\\-]{20,}$",
+    "required": true
+   },
+   {
+    "name": "telegram_bot_token",
+    "label": "Token do bot do Telegram (opcional)",
+    "type": "password",
+    "pattern": "^([0-9]+:[A-Za-z0-9_\\-]{30,})?$",
+    "required": false
+   }
+  ],
+  "secrets": [
+   "gateway_token"
+  ],
+  "compose": "services:\n  openclaw-gateway:\n    image: ghcr.io/openclaw/openclaw:2026.11.7\n    restart: unless-stopped\n    init: true\n    env_file:\n      - .env\n    environment:\n      HOME: /home/node\n      OPENCLAW_HOME: /home/node\n      OPENCLAW_STATE_DIR: /home/node/.openclaw\n      OPENCLAW_CONFIG_PATH: /home/node/.openclaw/openclaw.json\n      OPENCLAW_CONFIG_DIR: /home/node/.openclaw\n      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace\n      OPENCLAW_GATEWAY_PORT: \"18789\"\n      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}\n      TZ: America/Sao_Paulo\n    command: [\"node\", \"dist/index.js\", \"gateway\", \"--bind\", \"lan\", \"--port\", \"18789\"]\n    cap_drop:\n      - NET_RAW\n      - NET_ADMIN\n    security_opt:\n      - no-new-privileges:true\n    volumes:\n      - openclaw_state:/home/node/.openclaw\n      - openclaw_secrets:/home/node/.config/openclaw\n    healthcheck:\n      test: [\"CMD\", \"node\", \"dist/docker-healthcheck.js\"]\n      interval: 30s\n      timeout: 5s\n      retries: 5\n      start_period: 20s\n    networks:\n      - lctl\nvolumes:\n  openclaw_state:\n  openclaw_secrets:\nnetworks:\n  lctl:\n    external: true\n",
+  "env": {
+   "OPENCLAW_GATEWAY_TOKEN": "{{gateway_token}}",
+   "OPENAI_API_KEY": "{{openai_api_key}}",
+   "TELEGRAM_BOT_TOKEN": "{{telegram_bot_token}}",
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "openclaw-gateway",
+   "port": 18789
+  },
+  "post_up_cmd": "docker compose stop openclaw-gateway && docker compose run -T --rm --no-deps --entrypoint node openclaw-gateway dist/index.js onboard --non-interactive --accept-risk --skip-health --mode local --auth-choice openai-api-key --secret-input-mode ref --gateway-auth token --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN --skip-channels --no-install-daemon && docker compose run -T --rm --no-deps --entrypoint node openclaw-gateway dist/index.js config set --batch-json '[{\"path\":\"gateway.mode\",\"value\":\"local\"},{\"path\":\"gateway.bind\",\"value\":\"lan\"},{\"path\":\"gateway.controlUi.allowedOrigins\",\"value\":[\"https://{{domain}}\"]}]' && if [ -n \"{{telegram_bot_token}}\" ]; then docker compose run -T --rm --no-deps --entrypoint node openclaw-gateway dist/index.js channels add --channel telegram --use-env; fi && docker compose up -d openclaw-gateway",
+  "post_install": "Abrir https://{{domain}}/ (Control UI) e colar o token do gateway (OPENCLAW_GATEWAY_TOKEN do .env) em Settings. WhatsApp: 'docker compose run --rm --no-deps --entrypoint node openclaw-gateway dist/index.js channels login' e ler o QR code.",
+  "official_docs": "https://docs.openclaw.ai/install/docker",
+  "risk_notes": "Exige chave de provedor de IA paga (receita usa OpenAI, que é o exemplo do fluxo não interativo oficial; para Anthropic e outros, rodar 'onboard' interativo: valor de --auth-choice NÃO CONFIRMADO). Compose adaptado do oficial: sem portas publicadas (18789/18790/3978), bind mounts do HOME trocados por volumes nomeados e serviço openclaw-cli omitido. Liberar https://dominio em gateway.controlUi.allowedOrigins atrás de proxy é inferência (a doc só mostra localhost): NÃO CONFIRMADO. O agente executa ferramentas e age nas contas conectadas; a doc recomenda um gateway por fronteira de confiança. Para navegação web, usar a tag 2026.11.7-browser. Volumes nomeados: se o gateway (usuário node, uid 1000) não conseguir gravar em /home/node/.openclaw, ajustar dono para 1000:1000 (NÃO CONFIRMADO se a imagem já cria o diretório com o dono certo). post_up_cmd é um campo extra desta receita: comandos a rodar na pasta da stack após o primeiro 'up'."
+ },
+ {
+  "id": "hermes-agent",
+  "label": "Hermes Agent (Nous Research)",
+  "category": "Inteligência artificial",
+  "desc": "Agente de IA autônomo com memória e habilidades, integrado a Telegram, Discord e Slack, com painel web.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "Código aberto (MIT). Exige chave de um provedor de LLM (OpenRouter, Anthropic, OpenAI, Nous Portal), pago por uso, ou endpoint local.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 5,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [
+   {
+    "name": "openrouter_api_key",
+    "label": "Chave de API do OpenRouter (opcional)",
+    "type": "password",
+    "pattern": "^(sk-or-[A-Za-z0-9_\\-]{20,})?$",
+    "required": false
+   },
+   {
+    "name": "anthropic_api_key",
+    "label": "Chave de API da Anthropic (opcional)",
+    "type": "password",
+    "pattern": "^(sk-ant-[A-Za-z0-9_\\-]{20,})?$",
+    "required": false
+   },
+   {
+    "name": "dashboard_user",
+    "label": "Usuário do painel",
+    "type": "text",
+    "pattern": "^[a-zA-Z0-9_.-]{3,32}$",
+    "required": true,
+    "default": "admin"
+   }
+  ],
+  "secrets": [
+   "dashboard_password",
+   "api_server_key"
+  ],
+  "compose": "services:\n  hermes:\n    image: nousresearch/hermes-agent:v0.23.3\n    restart: unless-stopped\n    command: [\"gateway\", \"run\"]\n    shm_size: 1g\n    environment:\n      HERMES_DASHBOARD: \"1\"\n      HERMES_DASHBOARD_HOST: 0.0.0.0\n      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${DASHBOARD_USER}\n      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${DASHBOARD_PASSWORD}\n      API_SERVER_ENABLED: \"true\"\n      API_SERVER_HOST: 0.0.0.0\n      API_SERVER_KEY: ${API_SERVER_KEY}\n      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}\n      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}\n    volumes:\n      - hermes_data:/opt/data\n    networks:\n      - lctl\nvolumes:\n  hermes_data:\nnetworks:\n  lctl:\n    external: true\n",
+  "env": {
+   "DASHBOARD_USER": "{{dashboard_user}}",
+   "DASHBOARD_PASSWORD": "{{dashboard_password}}",
+   "API_SERVER_KEY": "{{api_server_key}}",
+   "OPENROUTER_API_KEY": "{{openrouter_api_key}}",
+   "ANTHROPIC_API_KEY": "{{anthropic_api_key}}"
+  },
+  "proxy": {
+   "service": "hermes",
+   "port": 9119
+  },
+  "post_install": "Abrir https://{{domain}} e entrar com o usuário e a senha do painel. Para escolher provedor/modelo e conectar Telegram/Discord/Slack: 'docker compose run -it --rm hermes setup' (interativo) e depois 'docker compose restart hermes'. A API compatível com OpenAI fica na porta interna 8642 (Bearer = API_SERVER_KEY).",
+  "official_docs": "https://hermes-agent.nousresearch.com/docs/user-guide/docker",
+  "risk_notes": "v0.23.3 = última estável (latest/stable). O assistente 'setup' é interativo; só passar a chave por variável pode não definir provedor/modelo: NÃO CONFIRMADO. A doc avisa que o gateway não deve ficar exposto direto na internet; aqui só o painel (9119) passa pelo proxy, e o próprio Hermes exige basic auth em bind não-loopback. Requisitos oficiais: 1 GB mínimo, 2-4 GB recomendado; ferramentas de navegador pedem 2 GB e shm de 1 GB. Nunca rodar dois containers no mesmo volume. Também há instalador nativo (scripts/install.sh), não usado aqui."
+ },
+ {
+  "id": "ollama-open-webui",
+  "label": "Ollama + Open WebUI",
+  "category": "Inteligência artificial",
+  "desc": "Modelos de linguagem locais (Llama, Qwen, Gemma etc.) com interface de chat estilo ChatGPT.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "Ollama: MIT. Open WebUI: licença própria baseada em BSD-3 com cláusula de marca (grátis; remover a marca exige licença acima de 50 usuários).",
+  "min_ram_mb": 8192,
+  "min_disk_gb": 50,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "webui_secret_key"
+  ],
+  "compose": "services:\n  ollama:\n    image: ollama/ollama:0.40.17\n    restart: unless-stopped\n    volumes:\n      - ollama_data:/root/.ollama\n    networks:\n      - default\n  open-webui:\n    image: ghcr.io/open-webui/open-webui:v0.13.4\n    restart: unless-stopped\n    depends_on:\n      - ollama\n    environment:\n      OLLAMA_BASE_URL: http://ollama:11434\n      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}\n      WEBUI_URL: https://${DOMAIN}\n    volumes:\n      - webui_data:/app/backend/data\n    networks:\n      - lctl\n      - default\nvolumes:\n  ollama_data:\n  webui_data:\nnetworks:\n  default:\n  lctl:\n    external: true\n",
+  "env": {
+   "WEBUI_SECRET_KEY": "{{webui_secret_key}}",
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "open-webui",
+   "port": 8080
+  },
+  "post_install": "Abrir https://{{domain}} e criar a conta (a primeira vira administradora). Baixar um modelo em Configurações > Modelos ou com 'docker compose exec ollama ollama pull llama3.2:3b'. Depois, desativar novos cadastros no Painel de Admin.",
+  "official_docs": "https://docs.openwebui.com/getting-started/quick-start/ ; https://docs.ollama.com/docker",
+  "risk_notes": "Sem GPU os modelos rodam na CPU e ficam lentos; GPU NVIDIA exige NVIDIA Container Toolkit no host e 'deploy.resources.reservations.devices' no serviço ollama (não incluído). RAM: ~8 GB para modelos 7-8B quantizados, 16 GB+ para 13B+; cada modelo ocupa de 2 a 40+ GB de disco. A API do Ollama (11434) não tem autenticação, por isso fica só na rede interna. O primeiro visitante vira admin."
+ },
+ {
+  "id": "chatwoot",
+  "label": "Chatwoot",
+  "category": "Marketing e CRM",
+  "desc": "Central de atendimento omnichannel (chat do site, WhatsApp, e-mail, Instagram) com caixa de entrada compartilhada.",
+  "kind": "docker",
+  "license": "freemium",
+  "license_note": "Imagem Community (-ce) é MIT e grátis; recursos Enterprise exigem plano pago.",
+  "min_ram_mb": 4096,
+  "min_disk_gb": 20,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "db_password",
+   "redis_password",
+   "secret_key_base"
+  ],
+  "compose": "services:\n  migrate:\n    image: chatwoot/chatwoot:v4.20.1-ce\n    restart: \"no\"\n    command: [\"bundle\", \"exec\", \"rails\", \"db:chatwoot_prepare\"]\n    depends_on:\n      - postgres\n      - redis\n    environment:\n      NODE_ENV: production\n      RAILS_ENV: production\n      INSTALLATION_ENV: docker\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      FRONTEND_URL: https://${DOMAIN}\n      ENABLE_ACCOUNT_SIGNUP: \"false\"\n      DEFAULT_LOCALE: pt_BR\n      RAILS_LOG_TO_STDOUT: \"true\"\n      POSTGRES_HOST: postgres\n      POSTGRES_USERNAME: chatwoot\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DATABASE: chatwoot\n      REDIS_URL: redis://redis:6379\n      REDIS_PASSWORD: ${REDIS_PASSWORD}\n      ACTIVE_STORAGE_SERVICE: local\n    volumes:\n      - storage_data:/app/storage\n    networks:\n      - db\n  rails:\n    image: chatwoot/chatwoot:v4.20.1-ce\n    restart: unless-stopped\n    entrypoint: docker/entrypoints/rails.sh\n    command: [\"bundle\", \"exec\", \"rails\", \"s\", \"-p\", \"3000\", \"-b\", \"0.0.0.0\"]\n    depends_on:\n      migrate:\n        condition: service_completed_successfully\n    environment:\n      NODE_ENV: production\n      RAILS_ENV: production\n      INSTALLATION_ENV: docker\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      FRONTEND_URL: https://${DOMAIN}\n      ENABLE_ACCOUNT_SIGNUP: \"false\"\n      DEFAULT_LOCALE: pt_BR\n      RAILS_LOG_TO_STDOUT: \"true\"\n      POSTGRES_HOST: postgres\n      POSTGRES_USERNAME: chatwoot\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DATABASE: chatwoot\n      REDIS_URL: redis://redis:6379\n      REDIS_PASSWORD: ${REDIS_PASSWORD}\n      ACTIVE_STORAGE_SERVICE: local\n    volumes:\n      - storage_data:/app/storage\n    networks:\n      - lctl\n      - db\n  sidekiq:\n    image: chatwoot/chatwoot:v4.20.1-ce\n    restart: unless-stopped\n    command: [\"bundle\", \"exec\", \"sidekiq\", \"-C\", \"config/sidekiq.yml\"]\n    depends_on:\n      migrate:\n        condition: service_completed_successfully\n    environment:\n      NODE_ENV: production\n      RAILS_ENV: production\n      INSTALLATION_ENV: docker\n      SECRET_KEY_BASE: ${SECRET_KEY_BASE}\n      FRONTEND_URL: https://${DOMAIN}\n      ENABLE_ACCOUNT_SIGNUP: \"false\"\n      DEFAULT_LOCALE: pt_BR\n      RAILS_LOG_TO_STDOUT: \"true\"\n      POSTGRES_HOST: postgres\n      POSTGRES_USERNAME: chatwoot\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n      POSTGRES_DATABASE: chatwoot\n      REDIS_URL: redis://redis:6379\n      REDIS_PASSWORD: ${REDIS_PASSWORD}\n      ACTIVE_STORAGE_SERVICE: local\n    volumes:\n      - storage_data:/app/storage\n    networks:\n      - default\n      - db\n  postgres:\n    image: pgvector/pgvector:0.8.7-pg16\n    restart: unless-stopped\n    environment:\n      POSTGRES_DB: chatwoot\n      POSTGRES_USER: chatwoot\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - postgres_data:/var/lib/postgresql/data\n    networks:\n      - db\n  redis:\n    image: redis:7.4.12-alpine\n    restart: unless-stopped\n    command: [\"sh\", \"-c\", \"redis-server --requirepass \\\"$$REDIS_PASSWORD\\\"\"]\n    environment:\n      REDIS_PASSWORD: ${REDIS_PASSWORD}\n    volumes:\n      - redis_data:/data\n    networks:\n      - db\nvolumes:\n  storage_data:\n  postgres_data:\n  redis_data:\nnetworks:\n  default:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}",
+   "DB_PASSWORD": "{{db_password}}",
+   "REDIS_PASSWORD": "{{redis_password}}",
+   "SECRET_KEY_BASE": "{{secret_key_base}}"
+  },
+  "proxy": {
+   "service": "rails",
+   "port": 3000
+  },
+  "post_install": "Abrir https://{{domain}} e criar a conta de super administrador. Configurar SMTP (SMTP_* e MAILER_SENDER_EMAIL no .env) para convites e notificações, e adicionar as caixas de entrada.",
+  "official_docs": "https://developers.chatwoot.com/self-hosted/deployment/docker ; https://developers.chatwoot.com/self-hosted/configuration/environment-variables",
+  "risk_notes": "O serviço 'migrate' roda 'rails db:chatwoot_prepare' (passo obrigatório da doc, idempotente) a cada subida e após atualizar a imagem. SECRET_KEY_BASE: gerar 128 caracteres hex. A doc pede ao Nginx 'underscores_in_headers on'; verificar se o lctl-proxy (Caddy) não descarta cabeçalhos com '_'. Imagem oficial usa pgvector:pg16 e redis:alpine, aqui com tags fixas. RAM mínima não consta na página de Docker: 4 GB é estimativa (NÃO CONFIRMADO)."
+ },
+ {
+  "id": "odoo",
+  "label": "Odoo Community",
+  "category": "Marketing e CRM",
+  "desc": "ERP e CRM modular: vendas, estoque, financeiro, site e muito mais.",
+  "kind": "docker",
+  "license": "freemium",
+  "license_note": "Community é LGPLv3 e grátis; Odoo Enterprise exige assinatura paga.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "db_password"
+  ],
+  "compose": "services:\n  odoo:\n    image: odoo:19.0-20261112\n    restart: unless-stopped\n    depends_on:\n      - db\n    command: [\"--proxy-mode\"]\n    environment:\n      HOST: db\n      USER: odoo\n      PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - odoo_data:/var/lib/odoo\n      - odoo_addons:/mnt/extra-addons\n    networks:\n      - lctl\n      - db\n  db:\n    image: postgres:17.12\n    restart: unless-stopped\n    environment:\n      POSTGRES_DB: postgres\n      POSTGRES_USER: odoo\n      POSTGRES_PASSWORD: ${DB_PASSWORD}\n    volumes:\n      - pg_data:/var/lib/postgresql/data\n    networks:\n      - db\nvolumes:\n  odoo_data:\n  odoo_addons:\n  pg_data:\nnetworks:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DB_PASSWORD": "{{db_password}}",
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "odoo",
+   "port": 8069
+  },
+  "post_install": "Abrir https://{{domain}}, definir a senha mestra (master password) e criar o primeiro banco com e-mail e senha do administrador, idioma Português (BR) e país Brasil.",
+  "official_docs": "https://hub.docker.com/_/odoo ; https://www.odoo.com/documentation/19.0/administration/on_premise/deploy.html",
+  "risk_notes": "Usada a 19.0; a 20.0 (tag 20.0-20261112) já existe, mas é a mais nova e muitos módulos da comunidade ainda não foram migrados. Até definir a senha mestra, qualquer visitante pode criar ou apagar bancos em /web/database/manager: fazer isso logo. Com workers>0 o websocket vai para a porta 8072 e o proxy teria de rotear /websocket (desnecessário no modo padrão). Localização fiscal brasileira (NF-e) exige módulos de terceiros (OCA l10n-brazil)."
+ },
+ {
+  "id": "nextcloud",
+  "label": "Nextcloud",
+  "category": "Infraestrutura e monitoramento",
+  "desc": "Nuvem privada para arquivos, calendário, contatos e colaboração, hospedada no seu servidor.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "AGPLv3. Suporte Enterprise é pago (opcional).",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [
+   {
+    "name": "admin_user",
+    "label": "Usuário administrador",
+    "type": "text",
+    "pattern": "^[a-zA-Z0-9_.@-]{3,64}$",
+    "required": true,
+    "default": "admin"
+   }
+  ],
+  "secrets": [
+   "db_password",
+   "db_root_password",
+   "redis_password",
+   "admin_password"
+  ],
+  "compose": "services:\n  app:\n    image: nextcloud:35.0.3-apache\n    restart: unless-stopped\n    depends_on:\n      - db\n      - redis\n    environment:\n      MYSQL_HOST: db\n      MYSQL_DATABASE: nextcloud\n      MYSQL_USER: nextcloud\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n      REDIS_HOST: redis\n      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}\n      NEXTCLOUD_ADMIN_USER: ${ADMIN_USER}\n      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      NEXTCLOUD_TRUSTED_DOMAINS: ${DOMAIN}\n      TRUSTED_PROXIES: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16\n      OVERWRITEPROTOCOL: https\n      OVERWRITEHOST: ${DOMAIN}\n      OVERWRITECLIURL: https://${DOMAIN}\n      PHP_MEMORY_LIMIT: 512M\n      PHP_UPLOAD_LIMIT: 10G\n    volumes:\n      - nextcloud_data:/var/www/html\n    networks:\n      - lctl\n      - db\n  cron:\n    image: nextcloud:35.0.3-apache\n    restart: unless-stopped\n    entrypoint: /cron.sh\n    depends_on:\n      - app\n    environment:\n      MYSQL_HOST: db\n      MYSQL_DATABASE: nextcloud\n      MYSQL_USER: nextcloud\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n      REDIS_HOST: redis\n      REDIS_HOST_PASSWORD: ${REDIS_PASSWORD}\n    volumes:\n      - nextcloud_data:/var/www/html\n    networks:\n      - default\n      - db\n  db:\n    image: mariadb:11.4.13\n    restart: unless-stopped\n    command: [\"--transaction-isolation=READ-COMMITTED\", \"--log-bin=binlog\", \"--binlog-format=ROW\"]\n    environment:\n      MARIADB_DATABASE: nextcloud\n      MARIADB_USER: nextcloud\n      MARIADB_PASSWORD: ${DB_PASSWORD}\n      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}\n    volumes:\n      - db_data:/var/lib/mysql\n    networks:\n      - db\n  redis:\n    image: redis:7.4.12-alpine\n    restart: unless-stopped\n    command: [\"sh\", \"-c\", \"redis-server --requirepass \\\"$$REDIS_PASSWORD\\\"\"]\n    environment:\n      REDIS_PASSWORD: ${REDIS_PASSWORD}\n    networks:\n      - db\nvolumes:\n  nextcloud_data:\n  db_data:\nnetworks:\n  default:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}",
+   "DB_PASSWORD": "{{db_password}}",
+   "DB_ROOT_PASSWORD": "{{db_root_password}}",
+   "REDIS_PASSWORD": "{{redis_password}}",
+   "ADMIN_USER": "{{admin_user}}",
+   "ADMIN_PASSWORD": "{{admin_password}}"
+  },
+  "proxy": {
+   "service": "app",
+   "port": 80
+  },
+  "post_install": "Aguardar a primeira inicialização (instalação automática, alguns minutos) e entrar em https://{{domain}} com o usuário administrador e a senha gerada (ADMIN_PASSWORD no .env). Conferir Configurações de administração > Visão geral.",
+  "official_docs": "https://github.com/nextcloud/docker ; https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html",
+  "risk_notes": "Instalação automática via NEXTCLOUD_ADMIN_* (imagem oficial). TRUSTED_PROXIES cobre as faixas privadas do Docker; restringir à sub-rede da rede lctl se possível. MariaDB 11.4 LTS (suportada pelo Nextcloud desde a 30); suporte à 11.8 na 35: NÃO CONFIRMADO. Os arquivos dos usuários ficam no volume nextcloud_data: dimensionar o disco conforme o uso. O upload de arquivos grandes também depende do limite de corpo do lctl-proxy."
+ },
+ {
+  "id": "ghost",
+  "label": "Ghost",
+  "category": "Sites e lojas",
+  "desc": "Plataforma de publicação para blogs, newsletters e assinaturas pagas.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "MIT. Ghost(Pro) hospedado é pago (não usado aqui).",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "db_password",
+   "db_root_password"
+  ],
+  "compose": "services:\n  app:\n    image: ghost:6.78.0\n    restart: unless-stopped\n    depends_on:\n      - db\n    environment:\n      url: https://${DOMAIN}\n      NODE_ENV: production\n      database__client: mysql\n      database__connection__host: db\n      database__connection__user: ghost\n      database__connection__password: ${DB_PASSWORD}\n      database__connection__database: ghost\n    volumes:\n      - ghost_content:/var/lib/ghost/content\n    networks:\n      - lctl\n      - db\n  db:\n    image: mysql:8.4.13\n    restart: unless-stopped\n    environment:\n      MYSQL_DATABASE: ghost\n      MYSQL_USER: ghost\n      MYSQL_PASSWORD: ${DB_PASSWORD}\n      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}\n    volumes:\n      - mysql_data:/var/lib/mysql\n    networks:\n      - db\nvolumes:\n  ghost_content:\n  mysql_data:\nnetworks:\n  lctl:\n    external: true\n  db:\n    internal: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}",
+   "DB_PASSWORD": "{{db_password}}",
+   "DB_ROOT_PASSWORD": "{{db_root_password}}"
+  },
+  "proxy": {
+   "service": "app",
+   "port": 2368
+  },
+  "post_install": "Abrir https://{{domain}}/ghost e criar a conta de proprietário. Configurar e-mail transacional (mail__* no .env, ex.: SMTP ou Mailgun) para login por link mágico e newsletters.",
+  "official_docs": "https://hub.docker.com/_/ghost ; https://docs.ghost.org/install/docker",
+  "risk_notes": "Ghost exige MySQL 8 em produção (SQLite só para desenvolvimento). O Ghost 6 oficial em Docker usa um compose próprio com Caddy e serviços opcionais (ActivityPub/Tinybird); aqui só o núcleo, sem esses extras. Sem e-mail configurado, convites de equipe e newsletters não funcionam. O primeiro acesso a /ghost cria o dono do site."
+ },
+ {
+  "kind": "script",
+  "id": "cpanel",
+  "label": "cPanel & WHM",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel de hospedagem comercial mais usado do mercado, com WHM para revendas e contas.",
+  "license": "pago",
+  "license_note": "Licença paga mensal por servidor; teste grátis de 15 dias (exige conta na cPanel Store com e-mail verificado).",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": [
+   "ubuntu-24.04",
+   "almalinux-8",
+   "almalinux-9",
+   "almalinux-10"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [
+   {
+    "name": "hostname",
+    "label": "Hostname do servidor (FQDN, ex.: srv1.seudominio.com.br)",
+    "type": "text",
+    "pattern": "^(?=.{1,60}$)([a-z0-9]([a-z0-9-]*[a-z0-9])?\\.){2,}[a-z]{2,}$",
+    "required": true
+   }
+  ],
+  "secrets": [],
+  "install_cmd": "set -e; hostnamectl set-hostname {{hostname}}; cd /home && curl -o latest -L https://securedownloads.cpanel.net/latest && sh latest",
+  "post_install": "Acessar https://IP_DO_SERVIDOR:2087 com root e a senha do root, aceitar os termos, ativar o teste de 15 dias ou a licença e configurar nameservers e IPs.",
+  "official_docs": "https://docs.cpanel.net/installation-guide/install/ ; https://docs.cpanel.net/installation-guide/system-requirements-ubuntu/ ; https://docs.cpanel.net/installation-guide/system-requirements-almalinux/",
+  "risk_notes": "Só em sistema recém-instalado. Não há desinstalador: para remover é preciso reformatar o servidor. Instalação não interativa, mas demorada (pode passar de 1 hora). Hostname: FQDN registrado, até 60 caracteres, diferente de qualquer domínio hospedado e resolvendo para o IP. Exige IP público estático. Ubuntu só 24.04; Alma 10 requer cPanel 132+. Também suporta Rocky e CloudLinux. Assume portas 80/443 e o firewall: incompatível com o lctl-proxy e as apps Docker do painel. RAM: 2 GB mínimo, 4 GB recomendado; disco 20 GB mínimo, 40 GB recomendado."
+ },
+ {
+  "kind": "script",
+  "id": "plesk",
+  "label": "Plesk",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel de hospedagem comercial com WordPress Toolkit, e-mail, DNS e gestão de sites.",
+  "license": "pago",
+  "license_note": "Licença paga (mensal ou anual); a instalação vem com licença de teste. Duração do teste: NÃO CONFIRMADO na doc consultada.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 20,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "debian-12",
+   "almalinux-8",
+   "almalinux-9"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "bash -c 'sh <(curl -fsSL https://autoinstall.plesk.com/one-click-installer || wget -O - https://autoinstall.plesk.com/one-click-installer)'",
+  "post_install": "Acessar https://IP_DO_SERVIDOR:8443 (ou o link de login exibido no fim da instalação), definir senha do admin, e-mail de contato e aplicar a licença.",
+  "official_docs": "https://docs.plesk.com/en-US/obsidian/deployment-guide/76444/ ; https://docs.plesk.com/release-notes/obsidian/software-requirements/",
+  "risk_notes": "Exige servidor limpo com acesso à internet. Instalação automática (sem perguntas) com configuração padrão, leva de 30 a 60 minutos. Requisitos oficiais: 1 GB RAM + 1 GB de swap, 20 GB de disco (2 GB indicado aqui). Também suporta Ubuntu 26.04, Debian 13, Alma 10 e Rocky 8. Abre as portas 8443 e 8447 e assume 80/443: incompatível com o lctl-proxy. Remoção completa só reinstalando o sistema."
+ },
+ {
+  "kind": "script",
+  "id": "cloudpanel",
+  "label": "CloudPanel",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel gratuito e leve para sites PHP, Node.js, Python e estáticos com Nginx.",
+  "license": "grátis",
+  "license_note": "Gratuito (Community Edition).",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 10,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "debian-12"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "set -e; export DEBIAN_FRONTEND=noninteractive; apt update && apt -y upgrade && apt -y install curl wget sudo; cd /root && curl -sS https://installer.cloudpanel.io/ce/v2/install.sh -o install.sh; echo \"8146dbe0a488e7088b04071b0c34d59aa0ab1fe9dcec382d395fd155c9e6c476 install.sh\" | sha256sum -c && sudo DB_ENGINE=MYSQL_8.4 bash install.sh",
+  "post_install": "Acessar https://IP_DO_SERVIDOR:8443 o quanto antes (aceitando o certificado autoassinado) e criar o usuário administrador.",
+  "official_docs": "https://www.cloudpanel.io/docs/v2/getting-started/other/ ; https://www.cloudpanel.io/docs/v2/requirements/",
+  "risk_notes": "Exige servidor vazio (Ubuntu 22.04/24.04/26.04 ou Debian 12/13). O hash SHA-256 do instalador muda a cada versão: se o sha256sum falhar, atualizar o hash pela doc oficial antes de instalar. Até criar o admin, quem acessar a porta 8443 primeiro assume o painel: a doc recomenda liberar a 8443 só para o seu IP. Ocupa 80/443 com Nginx: incompatível com o lctl-proxy. DB_ENGINE alternativos: MYSQL_8.0, MARIADB_11.8, MARIADB_11.4, MARIADB_10.11 etc."
+ },
+ {
+  "kind": "script",
+  "id": "aapanel",
+  "label": "aaPanel",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel gratuito de hospedagem com instalação de LNMP/LAMP, sites, bancos e Docker em poucos cliques.",
+  "license": "freemium",
+  "license_note": "Versão gratuita; plano Pro pago com recursos extras.",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "debian-12",
+   "almalinux-8",
+   "almalinux-9"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [
+   {
+    "name": "panel_user",
+    "label": "Usuário do painel",
+    "type": "text",
+    "pattern": "^[a-zA-Z0-9_]{5,32}$",
+    "required": true,
+    "default": "webadmin"
+   }
+  ],
+  "secrets": [
+   "admin_password"
+  ],
+  "install_cmd": "cd /root && URL=https://www.aapanel.com/script/install_panel_en.sh && if [ -f /usr/bin/curl ];then curl -ksSO $URL ;else wget --no-check-certificate -O install_panel_en.sh $URL;fi;bash install_panel_en.sh -y -u {{panel_user}} -p {{admin_password}}",
+  "post_install": "O instalador imprime no final a URL de acesso (porta aleatória e caminho de segurança). Consultar a qualquer momento com 'bt default'. Entrar com o usuário e a senha definidos e escolher a pilha (LNMP/LAMP).",
+  "official_docs": "https://www.aapanel.com/new/download.html",
+  "risk_notes": "Comando oficial da página de download; as flags -y (sem confirmação), -u e -p vêm do próprio script (opção --help), não da página: confirmadas no código em 23/11/2026. O script pode perguntar se deve trocar a fonte do apt ou forçar instalação em ambientes incomuns (ainda interativo nesses casos). Requisitos: mínimo 512 MB/1 núcleo, recomendado 1 GB; disco não informado (10 GB é estimativa). Também suporta Debian 13, Ubuntu 26.04, Alma/Rocky 10. Instala Nginx/Apache nas portas 80/443: incompatível com o lctl-proxy."
+ },
+ {
+  "kind": "script",
+  "id": "cyberpanel",
+  "label": "CyberPanel",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel gratuito com OpenLiteSpeed, e-mail, DNS e cache LiteSpeed para WordPress.",
+  "license": "freemium",
+  "license_note": "Grátis com OpenLiteSpeed; LiteSpeed Enterprise e add-ons são pagos.",
+  "min_ram_mb": 1024,
+  "min_disk_gb": 10,
+  "os": [
+   "ubuntu-22.04",
+   "ubuntu-24.04",
+   "almalinux-8",
+   "almalinux-9"
+  ],
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [
+   "admin_password"
+  ],
+  "install_cmd": "bash -c 'sh <(curl -fsSL https://cyberpanel.net/install.sh || wget -O - https://cyberpanel.net/install.sh) -v ols -p {{admin_password}} -a'",
+  "post_install": "Acessar https://IP_DO_SERVIDOR:8090 com usuário admin e a senha gerada.",
+  "official_docs": "https://cyberpanel.net/KnowledgeBase/home/install-cyberpanel/",
+  "risk_notes": "A doc mostra só o modo interativo; as flags -v ols (OpenLiteSpeed, silencioso), -p (senha) e -a (Redis/Memcached) vêm do código do instalador oficial (cyberpanel.sh, função Check_Argument): confirmadas no código, não na doc. A senha precisa passar na validação do script (usar só letras e números, 12+ caracteres). Servidor recém-instalado obrigatório. Sem a flag -p a senha padrão seria 1234567. Instala OpenLiteSpeed, Postfix, PowerDNS e Pure-FTPd, ocupando 80/443/53/25: incompatível com o lctl-proxy e não removível de forma limpa."
+ },
+ {
+  "id": "webmin",
+  "label": "Webmin",
+  "category": "Painéis de hospedagem",
+  "desc": "Painel web para administrar o sistema Linux (usuários, serviços, pacotes, firewall).",
+  "kind": "native",
+  "license": "grátis",
+  "license_note": "Software livre (BSD).",
+  "min_ram_mb": 512,
+  "min_disk_gb": 1,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "set -e; cd /root && curl -o webmin-setup-repo.sh https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh && sh webmin-setup-repo.sh --force && if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y webmin --install-recommends; else dnf install -y webmin; fi",
+  "post_install": "Acessar https://IP_DO_SERVIDOR:10000 com o usuário root (ou outro usuário com sudo) e a senha do sistema.",
+  "official_docs": "https://webmin.com/download/",
+  "risk_notes": "Convive com o painel (não usa 80/443), mas expõe a porta 10000 com login por senha do root: liberar no firewall só para IPs confiáveis. Usa certificado autoassinado. O Webmin pode alterar configurações que o agente do painel também gerencia (firewall, serviços). A flag --force do script de repositório pula a confirmação (documentada no --help do script). Requisitos mínimos não informados na doc: valores estimados."
+ },
+ {
+  "kind": "script",
+  "id": "coolify",
+  "label": "Coolify",
+  "category": "Painéis de hospedagem",
+  "desc": "PaaS self-hosted (alternativa ao Heroku/Vercel) para publicar apps, bancos e serviços com Docker.",
+  "license": "grátis",
+  "license_note": "Apache 2.0 self-hosted grátis; Coolify Cloud é pago.",
+  "min_ram_mb": 2048,
+  "min_disk_gb": 30,
+  "os": "any",
+  "dedicated_server": true,
+  "needs_domain": false,
+  "fields": [],
+  "secrets": [],
+  "install_cmd": "curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash",
+  "post_install": "Acessar http://IP_DO_SERVIDOR:8000 IMEDIATAMENTE e criar a conta de administrador (a janela de cadastro fecha em 10 minutos; se fechar, 'docker restart coolify'). Fazer backup de /data/coolify/source/.env.",
+  "official_docs": "https://coolify.io/docs/get-started/installation",
+  "risk_notes": "A doc recomenda servidor novo. O Coolify sobe o próprio proxy (Traefik) nas portas 80/443, conflitando com o lctl-proxy, e gerencia o Docker do host. Quem acessar a porta 8000 primeiro vira admin com acesso root ao servidor. Requisitos: 2 núcleos, 2 GB RAM, 10 GB livres + espaço para imagens/volumes/backups (30 GB indicado). Docker instalado via snap deve ser removido antes; em algumas distros RHEL o Docker precisa ser instalado manualmente."
+ },
+ {
+  "id": "portainer",
+  "label": "Portainer CE",
+  "category": "Infraestrutura e monitoramento",
+  "desc": "Interface web para gerenciar containers, imagens, volumes e stacks Docker.",
+  "kind": "docker",
+  "license": "freemium",
+  "license_note": "Community Edition grátis (zlib); Business Edition paga (grátis até 3 nós).",
+  "min_ram_mb": 512,
+  "min_disk_gb": 2,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [],
+  "compose": "services:\n  portainer:\n    image: portainer/portainer-ce:2.39.9\n    restart: unless-stopped\n    command: [\"-H\", \"unix:///var/run/docker.sock\"]\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n      - portainer_data:/data\n    networks:\n      - lctl\nvolumes:\n  portainer_data:\nnetworks:\n  lctl:\n    external: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "portainer",
+   "port": 9000
+  },
+  "post_install": "Abrir https://{{domain}} em até 5 minutos e criar o usuário admin (senha de 12+ caracteres). Se passar do prazo, reiniciar o container.",
+  "official_docs": "https://docs.portainer.io/start/install-ce/server/docker/linux",
+  "risk_notes": "Montar /var/run/docker.sock dá controle total do Docker e, na prática, root no host: proteger com senha forte e, se possível, restringir o acesso por IP. 2.39.9 = versão LTS; 2.45.x é STS (curto prazo). Por segurança, o Portainer desativa o cadastro inicial após 5 minutos sem configuração. Pode parar/apagar containers do próprio painel Linux Control."
+ },
+ {
+  "id": "uptime-kuma",
+  "label": "Uptime Kuma",
+  "category": "Infraestrutura e monitoramento",
+  "desc": "Monitor de disponibilidade de sites, APIs e portas com alertas e página de status.",
+  "kind": "docker",
+  "license": "grátis",
+  "license_note": "MIT.",
+  "min_ram_mb": 512,
+  "min_disk_gb": 2,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [],
+  "compose": "services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:2.5.12\n    restart: unless-stopped\n    volumes:\n      - kuma_data:/app/data\n    networks:\n      - lctl\nvolumes:\n  kuma_data:\nnetworks:\n  lctl:\n    external: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}"
+  },
+  "proxy": {
+   "service": "uptime-kuma",
+   "port": 3001
+  },
+  "post_install": "Abrir https://{{domain}}, escolher o banco (SQLite embutido) e criar o usuário administrador. Cadastrar monitores e notificações (e-mail, Telegram etc.).",
+  "official_docs": "https://github.com/louislam/uptime-kuma/wiki/%F0%9F%94%A7-How-to-Install",
+  "risk_notes": "O primeiro visitante cria o admin. Usa WebSocket (o Caddy repassa por padrão). Não usar volume em NFS (SQLite). 2.5.12 = estável da série 2; a 3.0 está em beta."
+ },
+ {
+  "id": "grafana",
+  "label": "Grafana",
+  "category": "Infraestrutura e monitoramento",
+  "desc": "Painéis e alertas para métricas, logs e dados de bancos (Prometheus, MySQL, Postgres e outros).",
+  "kind": "docker",
+  "license": "freemium",
+  "license_note": "Grafana OSS é AGPLv3 e grátis; Grafana Enterprise/Cloud são pagos.",
+  "min_ram_mb": 512,
+  "min_disk_gb": 2,
+  "os": "any",
+  "dedicated_server": false,
+  "needs_domain": true,
+  "fields": [],
+  "secrets": [
+   "admin_password"
+  ],
+  "compose": "services:\n  grafana:\n    image: grafana/grafana:13.3.1\n    restart: unless-stopped\n    environment:\n      GF_SERVER_ROOT_URL: https://${DOMAIN}/\n      GF_SERVER_DOMAIN: ${DOMAIN}\n      GF_SECURITY_ADMIN_USER: admin\n      GF_SECURITY_ADMIN_PASSWORD: ${ADMIN_PASSWORD}\n      GF_USERS_ALLOW_SIGN_UP: \"false\"\n    volumes:\n      - grafana_data:/var/lib/grafana\n    networks:\n      - lctl\nvolumes:\n  grafana_data:\nnetworks:\n  lctl:\n    external: true\n",
+  "env": {
+   "DOMAIN": "{{domain}}",
+   "ADMIN_PASSWORD": "{{admin_password}}"
+  },
+  "proxy": {
+   "service": "grafana",
+   "port": 3000
+  },
+  "post_install": "Entrar em https://{{domain}} com usuário admin e a senha gerada (ADMIN_PASSWORD no .env). Adicionar as fontes de dados (Prometheus, MySQL etc.).",
+  "official_docs": "https://grafana.com/docs/grafana/latest/setup-grafana/installation/docker/",
+  "risk_notes": "GF_SECURITY_ADMIN_PASSWORD só vale na primeira inicialização (depois a senha fica no banco interno). Requisitos oficiais mínimos: 512 MB e 1 núcleo. 13.3.1 = versão estável mais recente na data."
+ }
+]''')
+APP_BY_ID.update({r["id"]: r for r in APP_RECIPES})
+
+
 NTP_SH = ("if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?|ntpd?)\\.service'; then "
           "echo 'Nenhum serviço de hora encontrado; instalando o chrony.'; "
           "if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else dnf -y -q install chrony || yum -y -q install chrony; fi; "
@@ -1721,6 +2701,24 @@ ACTIONS = [
      "desc": "Libera o acesso por chave SSH para o root ou para um usuário.",
      "fields": [f_text("user", "Usuário", USER_RE, placeholder="root", suggest="users"),
                 dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE, placeholder="ssh-ed25519 AAAA… usuario@maquina", suggest="ssh_keys"), type="textarea")]},
+    {"id": "stacks.install", "group": "Aplicativos", "label": "Instalar aplicativo", "level": "admin", "placement": "apps", "timeout": 3600,
+     "run": run_stack_install, "desc": "Instala um aplicativo do catálogo (Docker com HTTPS automático, ou instalação nativa).",
+     "fields": [f_select("app", "Aplicativo", [r["id"] for r in APP_RECIPES] or ["-"]),
+                f_text("domain", "Domínio", DOMAIN_RE, required=False, placeholder="app.suaempresa.com.br",
+                       help="Aponte o DNS para este servidor. Vazio: o app fica numa porta própria, sem HTTPS."),
+                f_text("email", "E-mail para o certificado HTTPS", EMAIL_RE, required=False),
+                dict(f_text("options", "Opções", r"^\{[^\r\n]{0,4000}\}$", required=False), type="textarea")]},
+    {"id": "stack.logs", "group": "Aplicativos", "label": "Logs", "level": "read", "target": "stack", "fields": [f_text("name", "App", STACK_NAME_RE)],
+     "run": run_stack("logs"), "desc": "Últimas 300 linhas de log do aplicativo.", "when": "docker"},
+    {"id": "stack.restart", "group": "Aplicativos", "label": "Reiniciar", "level": "change", "target": "stack", "fields": [f_text("name", "App", STACK_NAME_RE)],
+     "run": run_stack("restart"), "desc": "Reinicia os containers do aplicativo.", "when": "running"},
+    {"id": "stack.stop", "group": "Aplicativos", "label": "Parar", "level": "danger", "confirm": True, "target": "stack",
+     "fields": [f_text("name", "App", STACK_NAME_RE)], "run": run_stack("stop"), "desc": "Para o aplicativo (os dados ficam).", "when": "running"},
+    {"id": "stack.start", "group": "Aplicativos", "label": "Iniciar", "level": "change", "target": "stack", "fields": [f_text("name", "App", STACK_NAME_RE)],
+     "run": run_stack("start"), "desc": "Liga o aplicativo de novo.", "when": "stopped"},
+    {"id": "stack.remove", "group": "Aplicativos", "label": "Remover", "level": "admin", "confirm": True, "target": "stack",
+     "fields": [f_text("name", "App", STACK_NAME_RE), f_bool("remove_data", "Apagar também os dados (banco, uploads). Sem volta.")],
+     "run": run_stack("remove"), "desc": "Remove o aplicativo. Sem marcar a opção, os dados ficam guardados.", "when": "docker"},
     {"id": "service.logs", "group": "Serviços", "label": "Logs", "level": "read", "target": "service", "fields": F_SERVICE(),
      "desc": "Últimas 200 linhas de log de um serviço.", "run": run_service_logs},
     {"id": "service.status", "group": "Serviços", "label": "Status", "level": "read", "target": "service", "fields": F_SERVICE(),
@@ -1786,7 +2784,7 @@ ACTIONS = [
 # Cada linha de tabela (serviço, container, usuário, programa, agendamento) traz "key" e "state" no inventário.
 # Uma ação com "target" aparece na linha quando todos os estados de "when" estão presentes, e o campo
 # "target_field" do formulário recebe a "key" da linha. Contas de sistema nunca recebem ações.
-TARGET_FIELD = {"service": "name", "container": "name", "user": "name", "app": "app", "cron": "id"}
+TARGET_FIELD = {"service": "name", "container": "name", "user": "name", "app": "app", "cron": "id", "stack": "name"}
 for _a in ACTIONS:
     if "target" in _a:
         _a["target_field"] = TARGET_FIELD[_a["target"]]
@@ -1868,6 +2866,8 @@ def collect_inventory(mode, with_packages):
         "docker": safe(docker),
         "software": safe(software, []),
         "apps": safe(apps_status, []),
+        "stacks": safe(stacks_status, []),
+        "app_catalog": app_catalog(),
         "websites": safe(websites, []),
         "certificates": safe(certificates, []),
         "cron": safe(cron_jobs, {}),
@@ -1889,6 +2889,180 @@ def tls_context(conf, url):
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
     return None
+
+
+def api(conf, method, path, payload=None, timeout=40):
+    """Chamada ao hub com o token do agente (canal rápido e terminal)."""
+    url = conf["HUB_URL"].rstrip("/") + path
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else None
+    req = urlrequest.Request(url, data=data, method=method, headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + conf["TOKEN"],
+        "User-Agent": "linux-control-agent/" + VERSION})
+    with urlrequest.urlopen(req, timeout=timeout, context=tls_context(conf, url)) as r:
+        return json.loads(r.read().decode("utf-8") or "{}")
+
+
+def wake_listener(conf, wake):
+    """Canal rápido: mantém um GET aberto no hub; quando chega ação ou terminal, acorda o ciclo principal."""
+    while True:
+        try:
+            if api(conf, "GET", "/api/agent/wait", timeout=40).get("wake"):
+                wake.set()
+        except Exception:
+            time.sleep(10)  # hub antigo (sem a rota) ou fora do ar: o ciclo normal continua funcionando
+
+
+# ---------------------------------------------------------------- terminal
+#
+# Só no modo admin. Um bash de login como root num pseudo-terminal; a entrada chega por long-poll e a
+# saída vai em lotes pequenos (a cada ~30 ms). O hub grava a sessão e fecha por inatividade.
+
+TERMINALS = set()
+TERMINAL_MAX = 3
+
+
+HUB_LOST_SECONDS = 90  # sem falar com o hub por esse tempo, o shell é encerrado (nada de root órfão)
+
+
+def run_terminal(conf, sid):
+    master = slave = proc = None
+    alive = {"on": True, "last_ok": time.time()}
+    reader = None
+    try:
+        master, slave = pty.openpty()
+        me = pwd.getpwuid(os.getuid())  # root quando instalado; o usuário atual nos testes
+        env = {"TERM": "xterm-256color", "HOME": me.pw_dir, "USER": me.pw_name, "LOGNAME": me.pw_name, "SHELL": "/bin/bash",
+               "LANG": os.environ.get("LANG", "C.UTF-8"), "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+               "LCTL_TERMINAL": sid[:8]}
+        shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+
+        def child_setup():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)  # o pseudo-terminal vira o terminal de controle (Ctrl+C funciona)
+
+        proc = subprocess.Popen([shell, "-l"], stdin=slave, stdout=slave, stderr=slave,
+                                cwd=me.pw_dir if os.access(me.pw_dir, os.X_OK) else "/", env=env, preexec_fn=child_setup, close_fds=True)
+        os.close(slave)
+        slave = None
+
+        def resize(r):
+            try:
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", int(r["rows"]), int(r["cols"]), 0, 0))
+            except (OSError, KeyError, ValueError, TypeError):
+                pass
+
+        def pump_input():
+            while alive["on"]:
+                try:
+                    msg = api(conf, "GET", "/api/agent/terminal/%s/in" % sid, timeout=40)
+                    alive["last_ok"] = time.time()
+                except urlerror.HTTPError as e:
+                    if e.code in (401, 404, 410):
+                        break  # sessão encerrada no hub ou token revogado
+                    time.sleep(2)
+                    continue
+                except Exception:
+                    time.sleep(2)
+                    continue
+                if not alive["on"]:
+                    break
+                if msg.get("resize"):
+                    resize(msg["resize"])
+                for chunk in msg.get("data") or []:
+                    try:
+                        os.write(master, base64.b64decode(chunk))
+                    except OSError:
+                        break
+                if msg.get("close"):
+                    break
+            alive["on"] = False
+
+        reader = threading.Thread(target=pump_input, daemon=True)
+        reader.start()
+        pending = b""
+        while alive["on"]:
+            if time.time() - alive["last_ok"] > HUB_LOST_SECONDS:
+                log("terminal %s: sem contato com o hub; encerrando o shell" % sid[:8])
+                break
+            r, _, _ = select.select([master], [], [], 1.0)
+            if r:
+                try:
+                    buf = os.read(master, 65536)
+                except OSError:
+                    buf = b""
+                if not buf:
+                    break  # o shell terminou
+                time.sleep(0.03)  # junta a saída em lotes para não fazer um POST por caractere
+                while select.select([master], [], [], 0)[0] and len(buf) < 262144:
+                    try:
+                        more = os.read(master, 65536)
+                    except OSError:
+                        break
+                    if not more:
+                        break
+                    buf += more
+                pending = (pending + buf)[-1048576:]  # se o envio falhar, guarda até 1 MB para a próxima tentativa
+            elif proc.poll() is not None:
+                break
+            if pending:
+                try:
+                    resp = api(conf, "POST", "/api/agent/terminal/%s/out" % sid, {"data": [base64.b64encode(pending).decode("ascii")]})
+                    alive["last_ok"] = time.time()
+                    pending = b""
+                    if resp.get("close"):
+                        break
+                except urlerror.HTTPError as e:
+                    if e.code in (401, 404, 410):
+                        break
+                    time.sleep(1)
+                except Exception as e:
+                    log("terminal %s: falha ao enviar saída (%s)" % (sid[:8], e))
+                    time.sleep(1)
+    finally:
+        alive["on"] = False
+        code = -1
+        if proc is not None:
+            # O shell é líder do próprio grupo (setsid): o grupo inteiro sai junto, inclusive o que ficou em segundo plano.
+            for sig, wait in ((signal.SIGHUP, 3), (signal.SIGKILL, 5)):
+                try:
+                    os.killpg(proc.pid, sig)
+                except OSError:
+                    pass
+                try:
+                    code = proc.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            code = proc.returncode if proc.returncode is not None else code
+        if reader is not None:
+            reader.join(45)  # só fecha o pseudo-terminal depois que a leitura parou de escrever nele
+        for fd in (slave, master):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        try:
+            api(conf, "POST", "/api/agent/terminal/%s/out" % sid, {"data": [], "exit": code}, timeout=10)
+        except Exception:
+            pass
+        TERMINALS.discard(sid)
+        log("terminal %s encerrado" % sid[:8])
+
+
+def open_terminals(conf, mode, sessions):
+    for t in sessions or []:
+        sid = str(t.get("id", ""))
+        if not re.fullmatch(r"[a-f0-9]{32}", sid) or sid in TERMINALS:
+            continue
+        if mode != "admin":
+            log("terminal recusado: o agente não está no modo admin")
+            continue
+        if len(TERMINALS) >= TERMINAL_MAX:
+            continue
+        TERMINALS.add(sid)
+        log("abrindo terminal %s" % sid[:8])
+        threading.Thread(target=run_terminal, args=(conf, sid), daemon=True).start()
 
 
 def post(conf, payload):
@@ -1953,11 +3127,15 @@ def run_command(cmd, mode, state):
     return {"id": cmd.get("id"), "exit_code": rc, "output": out, "duration": round(time.time() - started, 1)}
 
 
+WAKE = threading.Event()  # acorda o ciclo principal: resultado pronto ou aviso do hub
+
+
 def worker(q, results, lock, mode, state):
     while True:
         res = run_command(q.get(), mode, state)
         with lock:
             results.append(res)
+        WAKE.set()  # entrega o resultado já, sem esperar o próximo ciclo
 
 
 def main():
@@ -1988,6 +3166,8 @@ def main():
     q, results, lock = queue.Queue(), [], threading.Lock()
     state = {"force_inventory": False}
     threading.Thread(target=worker, args=(q, results, lock, mode, state), daemon=True).start()
+    wake = WAKE
+    threading.Thread(target=wake_listener, args=(conf, wake), daemon=True).start()
 
     last_inv = last_pkg = 0
     log("iniciado v%s, hub=%s, intervalo=%ss, ações=%s" % (VERSION, conf["HUB_URL"], interval, mode))
@@ -2011,7 +3191,8 @@ def main():
                 last_inv = 0
             for cmd in resp.get("commands", []):
                 q.put(cmd)
-            idle = q.empty() and not state.get("busy") and not results
+            open_terminals(conf, mode, resp.get("terminals"))
+            idle = q.empty() and not state.get("busy") and not results and not TERMINALS  # não reinicia com terminal aberto
             if auto_update and resp.get("agent_update") and idle:
                 safe(lambda: self_update(conf, resp["agent_update"]))
         except urlerror.HTTPError as e:
@@ -2027,7 +3208,9 @@ def main():
         if "--test" in args:
             log("teste concluído")
             return
-        time.sleep(max(1, interval - (time.time() - cycle)))
+        # Espera o próximo ciclo, ou acorda antes se o hub avisar (ação na fila, terminal para abrir).
+        wake.wait(max(1, interval - (time.time() - cycle)))
+        wake.clear()
 
 
 if __name__ == "__main__":

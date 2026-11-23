@@ -380,3 +380,89 @@ class Fail2banInstalacao(unittest.TestCase):
             rc, out = agent.run_fail2ban({}, {})
         self.assertEqual(rc, 0)
         self.assertIn("2 IP(s) bloqueado(s)", out)
+
+
+class Terminal(unittest.TestCase):
+    def test_shell_real_recebe_entrada_e_devolve_saida(self):
+        sent, calls = [], {"n": 0}
+
+        def fake_api(conf, method, path, payload=None, timeout=40):
+            if path.endswith("/in"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return {"data": [agent.base64.b64encode(b"echo lctl-$((40+2))\nexit 3\n").decode()], "resize": {"rows": 30, "cols": 100}}
+                time.sleep(0.2)
+                return {"data": []}
+            sent.append(payload)
+            return {"ok": True}
+
+        import time
+        with mock.patch.object(agent, "api", side_effect=fake_api), mock.patch.object(agent, "log"), \
+             mock.patch.dict(agent.os.environ, {"LANG": "C.UTF-8"}):
+            agent.TERMINALS.add("a" * 32)
+            agent.run_terminal({}, "a" * 32)
+        out = b"".join(agent.base64.b64decode(c) for p in sent for c in p.get("data", []))
+        self.assertIn(b"lctl-42", out)
+        self.assertEqual(sent[-1].get("exit"), 3)
+        self.assertNotIn("a" * 32, agent.TERMINALS)
+
+    def test_fora_do_modo_admin_nao_abre(self):
+        with mock.patch.object(agent.threading, "Thread") as th, mock.patch.object(agent, "log"):
+            agent.open_terminals({}, "all", [{"id": "b" * 32}])
+            agent.open_terminals({}, "admin", [{"id": "../etc"}])
+        th.assert_not_called()
+
+    def test_sem_contato_com_o_hub_o_shell_e_encerrado(self):
+        import time
+        def down(*a, **k):
+            time.sleep(0.1)
+            raise OSError("hub fora do ar")
+        with mock.patch.object(agent, "api", side_effect=down), mock.patch.object(agent, "log"), \
+             mock.patch.object(agent, "HUB_LOST_SECONDS", 1):
+            t0 = time.time()
+            agent.TERMINALS.add("c" * 32)
+            agent.run_terminal({}, "c" * 32)
+        self.assertLess(time.time() - t0, 15)
+        self.assertNotIn("c" * 32, agent.TERMINALS)
+
+
+class Aplicativos(unittest.TestCase):
+    def test_receitas_docker_tem_tag_fixa_e_proxy(self):
+        for r in agent.APP_RECIPES:
+            if r["kind"] == "docker":
+                self.assertNotIn(":latest", r["compose"], r["id"])
+                self.assertIn(r["proxy"]["service"], r["compose"], r["id"])
+            else:
+                self.assertTrue(r.get("install_cmd"), r["id"])
+
+    def test_instala_stack_com_dominio_gera_env_privado_override_e_site_do_proxy(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = []
+            def fake_run(cmd, timeout=20, merge=True, shell=False, env=None):
+                calls.append(cmd)
+                return (0, "")
+            with mock.patch.object(agent, "STACKS_DIR", os.path.join(d, "stacks")), mock.patch.object(agent, "PROXY_DIR", os.path.join(d, "proxy")), \
+                 mock.patch.object(agent, "which", return_value="/usr/bin/docker"), mock.patch.object(agent, "run", side_effect=fake_run), \
+                 mock.patch.object(agent, "compose_cmd", return_value=["docker", "compose"]), mock.patch.object(agent, "ports", return_value=[]), \
+                 mock.patch.object(agent, "proxy_container_running", return_value=False):
+                os.makedirs(os.path.join(d, "stacks"))
+                rc, out = agent.run_stack_install({"app": "wordpress", "domain": "blog.exemplo.com.br", "email": "ti@exemplo.com.br", "options": "{}"}, {})
+            self.assertEqual(rc, 0, out)
+            sd = os.path.join(d, "stacks", "blog")
+            self.assertEqual(oct(os.stat(os.path.join(sd, ".env")).st_mode & 0o777), "0o600")
+            env = open(os.path.join(sd, ".env")).read()
+            self.assertRegex(env, r"WORDPRESS_DB_PASSWORD=[A-Za-z0-9]{24}")
+            ov = agent.json.load(open(os.path.join(sd, "lctl.override.json")))
+            self.assertEqual(ov["services"]["app"]["networks"]["lctl"]["aliases"], ["blog-web"])
+            self.assertIn("blog.exemplo.com.br {\n\treverse_proxy blog-web:80", open(os.path.join(d, "proxy", "sites", "blog.caddy")).read())
+            self.assertIn("https://blog.exemplo.com.br", out)
+
+    def test_campo_sem_padrao_recusa_caracteres_de_shell(self):
+        with mock.patch.dict(agent.APP_BY_ID, {"x": {"id": "x", "label": "X", "kind": "script", "install_cmd": "echo {{nome}}",
+                                                    "fields": [{"name": "nome", "label": "Nome"}]}}):
+            rc, out = agent.run_stack_install({"app": "x", "options": '{"nome": "a; rm -rf /"}'}, {})
+        self.assertEqual(rc, 2)
+
+    def test_nome_de_stack_invalido_e_recusado(self):
+        rc, _ = agent.run_stack("logs")({"name": "../etc"}, {})
+        self.assertEqual(rc, 1)

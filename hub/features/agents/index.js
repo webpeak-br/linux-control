@@ -11,8 +11,18 @@ const AGENT_CONF = '/etc/linux-control/agent.conf';
 const AGENT_SERVICE = 'linux-control-agent';
 const MODES = ['readonly', 'all', 'admin'];
 
+const WAIT_MS = 25_000;
+
 function create({ config, net, features }) {
   const installScript = path.join(config.agentDir, 'install.sh');
+  // Canal rápido: o agente deixa um GET /api/agent/wait aberto; quando há ação na fila ou terminal para abrir,
+  // o hub responde na hora e o agente manda o relatório em seguida (em vez de esperar os 30 s do ciclo).
+  const waiters = new Map();   // serverId -> res
+  const pendingWake = new Set();
+  function wake(serverId) {
+    const res = waiters.get(serverId);
+    if (res) { waiters.delete(serverId); send(res, 200, { wake: true }); } else pendingWake.add(serverId);
+  }
 
   function commands(req, token) {
     const base = `curl -fsSL ${net.baseUrl(req)}/install.sh`;
@@ -32,6 +42,7 @@ function create({ config, net, features }) {
   }
 
   return {
+    wake,
     // Autentica antes de ler o corpo, para que clientes anônimos não consigam forçar o hub a ler 4 MB.
     authenticate: agentFromRequest,
     routes(router) {
@@ -58,8 +69,17 @@ function create({ config, net, features }) {
           commands: features.commands.exchange(agent.id, body.results),
           agent_update: features.updates.offerFor(agent.id, String(body.agent_version || '')),
           need_inventory: !agent.has_inventory && !body.inventory,
+          terminals: features.terminal.pendingFor(agent.id),
         };
       }, { auth: 'agent', bodyLimit: REPORT_LIMIT });
+      router.add('GET /api/agent/wait', ({ agent, res }) => {
+        if (pendingWake.delete(agent.id)) return { wake: true };
+        const old = waiters.get(agent.id);
+        if (old) send(old, 200, { wake: false });
+        waiters.set(agent.id, res);
+        const timer = setTimeout(() => { if (waiters.get(agent.id) === res) { waiters.delete(agent.id); send(res, 200, { wake: false }); } }, WAIT_MS);
+        res.on('close', () => { clearTimeout(timer); if (waiters.get(agent.id) === res) waiters.delete(agent.id); });
+      }, { auth: 'agent' });
       router.add('GET /install.sh', ({ req, res }) => {
         const pkg = features.updates.agentPackage();
         const script = fs.readFileSync(installScript, 'utf8')

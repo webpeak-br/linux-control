@@ -25,7 +25,7 @@ async function startHub(overrides = {}) {
     return { status: res.status, body: json };
   }
   const stop = () => { app.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); };
-  return { app, base, call, stop, dataDir, cfg, forgetCookie: () => { cookie = ''; } };
+  return { app, base, call, stop, dataDir, cfg, forgetCookie: () => { cookie = ''; }, cookie: () => cookie };
 }
 
 async function setupAdmin(hub) {

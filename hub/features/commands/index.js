@@ -58,6 +58,7 @@ function create({ db, now, features }) {
     const r = db.prepare(`INSERT INTO commands(server_id,action,params,param,label,status,timeout,created,requested_by) VALUES(?,?,?,?,?,?,?,?,?)`)
       .run(server.id, action.id, JSON.stringify(params), summary, String(action.label || action.id).slice(0, 120), S.queued, timeout, now(), ip);
     features.audit.record(ip, 'acao', `${server.name}: ${action.id}${summary ? ' ' + summary : ''}`);
+    features.agents.wake(server.id);
     return Number(r.lastInsertRowid);
   }
 

@@ -111,6 +111,12 @@ Cada problema do diagnóstico (`hub/features/servers/health.js`) tem um `code` e
 - **De estado** (Fail2ban, firewall, senha do root e login por senha no SSH, atualizações automáticas, relógio): declaram `done` no agente, uma conferência do estado real feita a cada inventário. Já aplicadas, mostram "✓ já aplicado"; as de risco ficam sem botão e as demais oferecem Reaplicar. O botão Resolver do diagnóstico nunca oferece uma ação já aplicada.
 - A aba Ações mostra quando cada ação rodou pela última vez e com que resultado.
 
+## Terminal, canal rápido e aplicativos
+
+- **Canal rápido:** o agente mantém um `GET /api/agent/wait` aberto (25 s). Ação na fila ou terminal pedido acorda o agente na hora; o resultado da ação também é enviado assim que termina.
+- **Terminal:** só no modo admin e com a senha do painel. O agente abre um bash de login num pseudo-terminal; a entrada chega por long-poll e a saída vai em lotes. O hub entrega ao navegador por SSE e grava a saída em `data/terminal/*.log` (90 dias; baixar pede a senha). Fecha com 15 min sem uso, 4 h no total, agente sem responder por 90 s ou hub inacessível por 90 s (o agente mata o grupo de processos do shell).
+- **Aplicativos:** receitas no agente (`APP_RECIPES`, pesquisadas na documentação oficial, imagens com versão fixa). Web roda em Docker Compose por pasta (`/opt/linux-control/stacks/<nome>`), com `.env` 0600 de senhas geradas e um override em JSON que liga o serviço à rede `lctl` do Caddy compartilhado (`lctl-proxy`), que emite o HTTPS. Painéis de hospedagem e LAMP/LEMP usam o instalador oficial e exigem servidor dedicado.
+
 ## Protocolo agente ↔ hub
 
 - `POST /api/agent/report` com `Authorization: Bearer <token>` e corpo `{ agent_version, interval, metrics, results: [{id, exit_code, output, duration}], inventory? }`. O inventário traz `actions` (catálogo) e, a cada 6 h, `packages`.

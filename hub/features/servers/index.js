@@ -26,7 +26,7 @@ const NAME_MAX = 80;
 const ACTION_ID = /^[a-z_]+\.[a-z0-9_]+$/;
 const FIELD_NAME = /^[a-z_]{1,40}$/;
 const FIELD_TYPES = new Set(['text', 'textarea', 'select', 'bool', 'cron']);
-const TARGETS = new Set(['service', 'container', 'user', 'app', 'cron']);
+const TARGETS = new Set(['service', 'container', 'user', 'app', 'cron', 'stack']);
 const LEVELS = new Set(['read', 'change', 'danger', 'admin']);
 
 const parseJSON = (s, d = null) => { try { return s ? JSON.parse(s) : d; } catch { return d; } };

@@ -185,5 +185,29 @@ async function audit(el) {
   el.innerHTML = `<div class="panel"><h3>Auditoria <span class="r dim small">últimos ${Number(limit)} eventos</span></h3><div class="tbl-wrap tall"><table>
     <thead><tr><th>Quando</th><th>Evento</th><th>Detalhe</th><th>IP</th></tr></thead><tbody>${events.map(e => `<tr><td class="small">${dt(e.ts)}</td>
     <td>${esc(e.label)}</td><td class="small">${esc(e.detail)}</td><td class="small mono muted">${esc(e.ip)}</td></tr>`).join('')
-    || '<tr><td class="muted" colspan="4">Nada registrado.</td></tr>'}</tbody></table></div></div>`;
+    || '<tr><td class="muted" colspan="4">Nada registrado.</td></tr>'}</tbody></table></div></div>
+    <div class="panel"><h3>Gravações de terminal</h3><div id="recs" class="small muted">Carregando…</div></div>`;
+  const { recordings } = await api('/api/terminal/recordings').catch(() => ({ recordings: [] }));
+  el.querySelector('#recs').innerHTML = recordings.length
+    ? `<div class="tbl-wrap"><table><tbody>${recordings.map(r => `<tr><td class="mono small">${esc(r.name)}</td><td class="num small">${Math.max(1, Math.round(r.size / 1024))} KB</td>
+      <td class="acts"><button class="btn sm ghost" data-rec="${esc(r.name)}">Baixar</button></td></tr>`).join('')}</tbody></table></div>
+      <p class="small muted">As gravações guardam tudo o que apareceu na tela (inclusive segredos exibidos) e são apagadas após 90 dias. Baixar pede a senha.</p>`
+    : 'Nenhuma sessão de terminal gravada.';
+  el.querySelectorAll('[data-rec]').forEach(b => {
+    b.onclick = () => modal(`<h2>Baixar gravação</h2><p class="small mono">${esc(b.dataset.rec)}</p><form id="rf">
+      <label for="rp">Confirme a senha do painel</label><input type="password" id="rp" autocomplete="current-password"><div class="err" id="re"></div>
+      <div class="foot"><button type="button" class="btn ghost" data-close>Cancelar</button><button class="btn primary">Baixar</button></div></form>`, (box, close) => {
+      box.querySelector('#rp').focus();
+      box.querySelector('#rf').onsubmit = async e => {
+        e.preventDefault();
+        const res = await fetch(`/api/terminal/recordings/${encodeURIComponent(b.dataset.rec)}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-LCtl': '1' }, body: JSON.stringify({ password: box.querySelector('#rp').value }) });
+        if (!res.ok) { box.querySelector('#re').textContent = ((await res.json().catch(() => ({}))).error) || 'Falhou.'; return; }
+        const url = URL.createObjectURL(await res.blob());
+        const a = document.createElement('a'); a.href = url; a.download = b.dataset.rec; a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        close();
+      };
+    });
+  });
 }
