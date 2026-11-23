@@ -1,12 +1,36 @@
-// Avalia a saúde de um servidor a partir das métricas e do inventário.
-// Retorna { status: ok|warn|crit|offline|pending, issues: [{level, area, text}] }
+// Diagnóstico de um servidor a partir das métricas e do inventário.
+// evaluate() -> { status: ok|warn|crit|offline|pending, label, issues: [{level, area, text}] }
+// Os limites ficam aqui; a interface recebe os níveis prontos e só pinta.
 'use strict';
+
+const LIMITS = {
+  disk: { warn: 80, crit: 90 },
+  inode: { crit: 90 },
+  mem: { warn: 85, crit: 95 },
+  swap: { warn: 80 },
+  cpu: { warn: 90 },
+  loadPerCore: { warn: 1.2, crit: 2 },
+};
+const CERT_WARN_DAYS = 14;
+const LABELS = { ok: 'Saudável', warn: 'Atenção', crit: 'Crítico', offline: 'Offline', pending: 'Aguardando' };
+
+const certLevel = c => (c.days_left < 0 ? 'crit' : c.days_left < CERT_WARN_DAYS ? 'warn' : 'ok');
+// Em SSH só "yes" é problema; qualquer outro valor (no, prohibit-password…) é aceitável.
+const sshLevel = (key, value) => (value !== 'yes' ? 'ok' : key === 'permitrootlogin' ? 'warn' : 'info');
+
+function metricLevel(kind, value) {
+  const l = LIMITS[kind];
+  if (!l || value == null) return 'ok';
+  if (l.crit != null && value >= l.crit) return 'crit';
+  if (l.warn != null && value >= l.warn) return 'warn';
+  return 'ok';
+}
 
 function evaluate(srv, now = Date.now() / 1000) {
   const issues = [];
   const add = (level, area, text) => issues.push({ level, area, text });
 
-  if (!srv.last_seen) return { status: 'pending', issues: [{ level: 'info', area: 'agente', text: 'Aguardando o primeiro contato do agente.' }] };
+  if (!srv.last_seen) return { status: 'pending', label: LABELS.pending, issues: [{ level: 'info', area: 'agente', text: 'Aguardando o primeiro contato do agente.' }] };
 
   const interval = srv.interval || 30;
   const age = now - srv.last_seen;
@@ -17,22 +41,17 @@ function evaluate(srv, now = Date.now() / 1000) {
   const inv = srv.inventory || {};
   const sys = inv.system || {};
 
+  const addLevel = (kind, value, area, text) => { const lv = metricLevel(kind, value); if (lv !== 'ok') add(lv, area, text); };
   for (const d of m.disks || []) {
-    if (d.pct >= 90) add('crit', 'disco', `Disco ${d.mount} com ${d.pct}% de uso.`);
-    else if (d.pct >= 80) add('warn', 'disco', `Disco ${d.mount} com ${d.pct}% de uso.`);
-    if (d.inode_pct >= 90) add('crit', 'disco', `Inodes de ${d.mount} em ${d.inode_pct}% (muitos arquivos pequenos).`);
+    addLevel('disk', d.pct, 'disco', `Disco ${d.mount} com ${d.pct}% de uso.`);
+    addLevel('inode', d.inode_pct, 'disco', `Inodes de ${d.mount} em ${d.inode_pct}% (muitos arquivos pequenos).`);
   }
   if (m.mem) {
-    if (m.mem.pct >= 95) add('crit', 'memória', `Memória em ${m.mem.pct}%.`);
-    else if (m.mem.pct >= 85) add('warn', 'memória', `Memória em ${m.mem.pct}%.`);
-    if (m.mem.swap_pct >= 80) add('warn', 'memória', `Swap em ${m.mem.swap_pct}% (servidor pode estar lento).`);
+    addLevel('mem', m.mem.pct, 'memória', `Memória em ${m.mem.pct}%.`);
+    addLevel('swap', m.mem.swap_pct, 'memória', `Swap em ${m.mem.swap_pct}% (servidor pode estar lento).`);
   }
-  if (m.load && m.ncpu) {
-    const r = m.load[1] / m.ncpu;
-    if (r >= 2) add('crit', 'cpu', `Carga média (5 min) ${m.load[1]} para ${m.ncpu} núcleos.`);
-    else if (r >= 1.2) add('warn', 'cpu', `Carga média (5 min) ${m.load[1]} para ${m.ncpu} núcleos.`);
-  }
-  if (m.cpu >= 90) add('warn', 'cpu', `CPU em ${m.cpu}% agora.`);
+  if (m.load && m.ncpu) addLevel('loadPerCore', m.load[1] / m.ncpu, 'cpu', `Carga média (5 min) ${m.load[1]} para ${m.ncpu} núcleos.`);
+  addLevel('cpu', m.cpu, 'cpu', `CPU em ${m.cpu}% agora.`);
   if (m.procs && m.procs.zombies > 5) add('info', 'cpu', `${m.procs.zombies} processos zumbis.`);
 
   const units = (inv.services && inv.services.units) || [];
@@ -53,19 +72,19 @@ function evaluate(srv, now = Date.now() / 1000) {
   if (sys.is_root !== false) {
     if (sec.firewall && !sec.firewall.active) add('warn', 'segurança', 'Nenhum firewall ativo detectado.');
     const ssh = sec.ssh || {};
-    if (ssh.permitrootlogin === 'yes') add('warn', 'segurança', 'SSH permite login direto como root com senha.');
-    if (ssh.passwordauthentication === 'yes') add('info', 'segurança', 'SSH aceita login por senha (prefira chaves).');
+    if (sshLevel('permitrootlogin', ssh.permitrootlogin) !== 'ok') add('warn', 'segurança', 'SSH permite login direto como root com senha.');
+    if (sshLevel('passwordauthentication', ssh.passwordauthentication) !== 'ok') add('info', 'segurança', 'SSH aceita login por senha (prefira chaves).');
   }
   if (sec.failed_logins_24h >= 50) add(sec.failed_logins_24h >= 1000 ? 'warn' : 'info', 'segurança', `${sec.failed_logins_24h} tentativas de login SSH falhas em 24h.`);
   if (sec.auto_updates === false) add('info', 'segurança', 'Atualizações automáticas de segurança desativadas.');
 
   for (const c of inv.certificates || []) {
-    if (c.days_left < 0) add('crit', 'certificados', `Certificado ${c.name} expirou.`);
-    else if (c.days_left < 14) add('warn', 'certificados', `Certificado ${c.name} expira em ${c.days_left} dia(s).`);
+    const lv = certLevel(c);
+    if (lv !== 'ok') add(lv, 'certificados', c.days_left < 0 ? `Certificado ${c.name} expirou.` : `Certificado ${c.name} expira em ${c.days_left} dia(s).`);
   }
   const dk = inv.docker;
   if (dk && dk.containers) {
-    const bad = dk.containers.filter(c => c.state === 'restarting' || (c.state === 'exited' && !/Exited \(0\)/.test(c.status || '')));
+    const bad = dk.containers.filter(c => c.docker_state === 'restarting' || (c.docker_state === 'exited' && !/Exited \(0\)/.test(c.status || '')));
     if (bad.length) add('info', 'docker', `${bad.length} container(s) parado(s) com erro: ${bad.slice(0, 4).map(c => c.name).join(', ')}.`);
   }
 
@@ -75,7 +94,7 @@ function evaluate(srv, now = Date.now() / 1000) {
   if (offline) status = 'offline';
   else if (issues.some(i => i.level === 'crit')) status = 'crit';
   else if (issues.some(i => i.level === 'warn')) status = 'warn';
-  return { status, issues };
+  return { status, label: LABELS[status], issues };
 }
 
 function fmtAge(s) {
@@ -85,4 +104,4 @@ function fmtAge(s) {
   return `${Math.round(s / 86400)} dias`;
 }
 
-module.exports = { evaluate };
+module.exports = { evaluate, metricLevel, certLevel, sshLevel, LABELS };

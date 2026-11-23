@@ -2,7 +2,9 @@
 # Instalador do Linux Control Agent. Normalmente servido pelo hub em /install.sh:
 #   curl -fsSL https://SEU-HUB/install.sh | sudo sh -s -- <TOKEN>
 # Opções (variáveis de ambiente):
-#   LCTL_ACTIONS=all|readonly|none   quais ações o painel pode executar (padrão: all)
+#   LCTL_ACTIONS=all|readonly|admin|none  ações liberadas (padrão: all; admin libera usuários, cron e instaladores)
+#   LCTL_AUTO_UPDATE=0|1             aceitar a atualização automática enviada pelo hub
+#                                    (padrão: 1 nos modos all/admin; 0 em readonly/none, que não confiam ações ao hub)
 #   LCTL_INTERVAL=30                 segundos entre envios
 #   LCTL_INSECURE_TLS=1              aceitar certificado autoassinado no hub
 # Desinstalar:
@@ -67,14 +69,18 @@ if command -v sha256sum >/dev/null 2>&1 && [ "${AGENT_SHA256#__}" = "$AGENT_SHA2
 fi
 chmod 755 "$BIN_DIR/linux-control-agent.py"
 
+ACTIONS="${LCTL_ACTIONS:-all}"
+case "$ACTIONS" in all|admin) AUTO_UPDATE="${LCTL_AUTO_UPDATE:-1}" ;; *) AUTO_UPDATE="${LCTL_AUTO_UPDATE:-0}" ;; esac
+
 umask 077
 cat > "$CONF_DIR/agent.conf" <<EOF
 # Linux Control Agent - configuração
 HUB_URL=$HUB_URL
 TOKEN=$TOKEN
 INTERVAL=${LCTL_INTERVAL:-30}
-ACTIONS=${LCTL_ACTIONS:-all}
+ACTIONS=$ACTIONS
 INSECURE_TLS=${LCTL_INSECURE_TLS:-0}
+AUTO_UPDATE=$AUTO_UPDATE
 EOF
 chmod 600 "$CONF_DIR/agent.conf"
 
