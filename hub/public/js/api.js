@@ -7,7 +7,7 @@ function offline(on) {
   let bar = document.getElementById('offline');
   if (on && !bar) {
     bar = document.createElement('div');
-    bar.id = 'offline'; bar.className = 'offline';
+    bar.id = 'offline'; bar.className = 'offline-banner';
     bar.textContent = 'Sem conexão com o painel. Tentando de novo…';
     document.body.appendChild(bar);
   } else if (!on && bar) bar.remove();
