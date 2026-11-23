@@ -37,7 +37,7 @@ import time
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 CONF_PATH = os.environ.get("LCTL_CONF", "/etc/linux-control/agent.conf")
 MAX_OUTPUT = 64 * 1024
 ENV_C = dict(os.environ, LC_ALL="C", LANG="C")
