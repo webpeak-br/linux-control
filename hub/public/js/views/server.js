@@ -10,7 +10,7 @@
 // ctx oferece rerender() (redesenha com os dados atuais) e reload() (busca de novo).
 import { api } from '../api.js';
 import { esc, ago, dur, ipsOf, STATUS_PILL, datacenter, ipPlace, flag } from '../util.js';
-import { bindRunButtons, loadAgentCommands } from '../actions.js';
+import { bindRunButtons, loadAgentCommands, setRecentCommands, activityTray } from '../actions.js';
 import { bindCopy } from '../ui.js';
 import * as overview from './tabs/overview.js';
 import * as disks from './tabs/disks.js';
@@ -32,7 +32,8 @@ export function serverView(root, id, tabName, arg) {
   const key = TABS[tabName] ? tabName : 'overview';
   const tab = TABS[key];
   const ctx = { id, arg, rerender: () => renderBody(), reload: () => load() };
-  const goToCommand = cmdId => { location.hash = `#/server/${id}/actions/${cmdId}`; };
+  // Depois de enviar uma ação a pessoa continua na tela; o botão e o painel de Atividades mostram o andamento.
+  const afterQueue = () => { load(true).catch(() => {}); };
   let server = null, lastHtml = '';
 
   root.innerHTML = '<div class="muted">Carregando…</div>';
@@ -70,17 +71,19 @@ export function serverView(root, id, tabName, arg) {
     lastHtml = html;
     el.innerHTML = html;
     bindCopy(el);
-    bindRunButtons(el, server, goToCommand);
+    bindRunButtons(el, server, afterQueue);
     if (tab.bind) tab.bind(el, server, ctx);
   }
 
   async function load(fromTimer = false) {
     const first = !server;
-    server = (await api(`/api/servers/${id}`)).server;
+    const [srv, cmds] = await Promise.all([api(`/api/servers/${id}`), api(`/api/servers/${id}/commands`).catch(() => ({ commands: [] }))]);
+    server = srv.server;
+    setRecentCommands(cmds.commands);
     if (first) await loadAgentCommands();
     if (tab.load) await tab.load(server, ctx);
     if (first) {
-      root.innerHTML = header() + '<div id="tabctl"></div><div id="tabbody"></div>';
+      root.innerHTML = header() + '<div id="tabctl"></div><div id="tabbody"></div><div id="activity"></div>';
       if (tab.controls && server.last_seen) {
         const ctl = root.querySelector('#tabctl');
         ctl.innerHTML = tab.controls(server, ctx);
@@ -90,6 +93,15 @@ export function serverView(root, id, tabName, arg) {
       root.querySelector('#meta').innerHTML = meta();
     }
     renderBody(fromTimer);
+    const tray = root.querySelector('#activity');
+    const html = activityTray(id);
+    // Mantém aberto/fechado como a pessoa deixou.
+    const wasOpen = tray.firstElementChild ? tray.firstElementChild.open : null;
+    if (tray.dataset.html !== html) {
+      tray.dataset.html = html;
+      tray.innerHTML = html;
+      if (wasOpen !== null && tray.firstElementChild) tray.firstElementChild.open = wasOpen || html.includes('em andamento');
+    }
   }
 
   load().catch(e => { root.innerHTML = `<div class="empty">${esc(e.message)} <a href="#/">Voltar</a></div>`; });

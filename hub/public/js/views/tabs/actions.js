@@ -1,17 +1,13 @@
 import { api } from '../../api.js';
 import { esc, N, dt } from '../../util.js';
 import { toast } from '../../ui.js';
-import { catalog, actionRow, mode } from '../../actions.js';
+import { catalog, actionRow, mode, COMMAND_STATUS as STATUS } from '../../actions.js';
 
 export const label = 'Ações';
 export const refreshMs = 3000;
 
 const open = new Set();
 let commands = [];
-const STATUS = {
-  queued: ['', 'na fila'], sent: ['info', 'executando'], done: ['ok', 'concluído'], failed: ['crit', 'falhou'],
-  lost: ['warn', 'sem resposta'], canceled: ['', 'cancelado'], expired: ['', 'expirou na fila'],
-};
 
 // A rota #/server/:id/actions/:cmd abre a saída dessa execução.
 export async function load(s, ctx) {

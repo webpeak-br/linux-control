@@ -269,3 +269,9 @@ details summary { cursor: pointer; color: var(--brand2); }
 .srv-where { font-size: 12px; color: var(--muted); margin: -2px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .act-side { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .act.done .t { color: var(--muted); }
+.tray { position: fixed; right: 16px; bottom: 16px; z-index: 200; width: min(420px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.35); font-size: 13px; }
+.tray summary { cursor: pointer; padding: 10px 14px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+.tray-row { display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-top: 1px solid var(--line); }
+.tray-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tray-row a { font-size: 12px; white-space: nowrap; }
