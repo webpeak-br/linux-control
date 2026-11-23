@@ -141,7 +141,7 @@ test('vulnerabilidades: nota CVSS 3.1, ecossistema e resumo do aviso OSV', () =>
 });
 
 test('vulnerabilidades com correção entram no diagnóstico com o código que o botão Resolver usa', () => {
-  const issues = evaluate({ last_seen: now, metrics: {}, inventory: {}, vulns: { fixable: 12, fixable_high: 3, fixable_critical: 1, unfixed: 40, unfixed_high: 2 } }, now).issues;
+  const issues = evaluate({ last_seen: now, metrics: {}, inventory: {}, vulns: { fixable: 12, fixable_high: 3, fixable_critical: 1, waiting: 5, waiting_high: 1, unfixed: 40, unfixed_high: 2 } }, now).issues;
   const fix = issues.find(i => i.code === 'cve_fixable');
   assert.equal(fix.level, 'crit');
   assert.equal(fix.see, 'vulns');
@@ -169,4 +169,15 @@ test('vulnerabilidades: kernels antigos instalados ficam fora da contagem', () =
   assert.deepEqual(q.filter(x => x.name === 'linux').map(x => x.version), ['7.0.0-44.44']);
   assert.deepEqual(q.oldKernels.sort(), ['7.0.0-30.30', '7.0.0-9.9']);
   assert.ok(q.find(x => x.name === 'linux-firmware') && q.find(x => x.name === 'bash'));
+});
+
+test('vulnerabilidades: correção publicada que o apt ainda não oferece fica como "aguardando liberação"', () => {
+  const { markAvailable } = require('../../hub/features/vulns');
+  const items = markAvailable([
+    { pkg: 'linux', binaries: ['linux-image-6.8.0-149-generic'], fixed: '6.8.0-151.151' },
+    { pkg: 'openssl', binaries: ['libssl3', 'openssl'], fixed: '3.0.13-9' },
+    { pkg: 'curl', binaries: ['curl'], fixed: null },
+  ], [{ name: 'libssl3', new: '3.0.13-9' }]);
+  assert.deepEqual(items.map(i => i.available), [false, true, false]);
+  assert.equal(markAvailable([{ pkg: 'linux', binaries: ['linux-image-6.8.0-149-generic'], fixed: 'x' }], [{ name: 'linux-generic' }])[0].available, true);
 });

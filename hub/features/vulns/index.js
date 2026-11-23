@@ -12,7 +12,9 @@ const migrations = [{ name: 'vulns:1', sql: [
 { name: 'vulns:2', sql: ['DELETE FROM vuln_cache'] },
 { name: 'vulns:3', tolerant: true, sql: ['ALTER TABLE server_vulns ADD COLUMN summary TEXT'] },
 // v0.8.2: kernels antigos fora da contagem; reanalisa tudo.
-{ name: 'vulns:4', sql: ['UPDATE server_vulns SET packages_at = -1'] }];
+{ name: 'vulns:4', sql: ['UPDATE server_vulns SET packages_at = -1'] },
+// v0.8.3: separa correção para instalar de correção que ainda não chegou ao servidor.
+{ name: 'vulns:5', sql: ['UPDATE server_vulns SET packages_at = -1'] }];
 const CACHE_SECONDS = 7 * 86400;
 const BATCH = 1000;
 const MAX_VULNS = 5000;
@@ -110,6 +112,19 @@ function queriesFrom(installed, ecosystem) {
   return out;
 }
 
+// Marca em cada item se a correção já é oferecida pelo gerenciador de pacotes deste servidor. O kernel novo
+// chega com nome de pacote novo, pelo metapacote (linux-generic, linux-image-generic…).
+function markAvailable(items, updates) {
+  const names = new Set(updates.map(u => u.name));
+  const kernelMeta = updates.some(u => /^linux-(generic|image|headers|virtual|aws|azure|gcp|oracle|kvm|lowlatency|hwe|signed)/.test(u.name));
+  for (const i of items) {
+    if (!i.fixed) { i.available = false; continue; }
+    const bins = i.binaries && i.binaries.length ? i.binaries : [i.pkg];
+    i.available = bins.some(b => names.has(b)) || (bins.every(b => KERNEL_BIN.test(b)) && kernelMeta);
+  }
+  return items;
+}
+
 const KERNEL_BIN = /^linux-(image|modules|headers|tools|buildinfo|cloud-tools|objects|signatures|lib-rust)(-|$)/;
 
 // Comparação aproximada de versões Debian (suficiente para escolher o kernel mais novo).
@@ -185,16 +200,22 @@ function create({ db, now, config, features }) {
         const v = info.get(id);
         for (const p of hits.get(id)) items.push(v ? summarize(v, p, eco) : { id, pkg: p.name, installed: p.version, severity: 'unknown', fixed: null, url: `https://osv.dev/vulnerability/${encodeURIComponent(id)}` });
       }
+      // A distribuição já ter corrigido não quer dizer que a correção chegou a este servidor (liberação gradual,
+      // espelho atrasado, Ubuntu Pro). Só conta como "para instalar" o que o gerenciador de pacotes já oferece.
+      markAvailable(items, (srv.packages || {}).updates || []);
       const order = Object.fromEntries(SEVERITIES.map((s, i) => [s, i]));
-      items.sort((a, b) => (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || order[a.severity] - order[b.severity] || (b.score || 0) - (a.score || 0));
+      items.sort((a, b) => (b.available ? 1 : 0) - (a.available ? 1 : 0) || (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || order[a.severity] - order[b.severity] || (b.score || 0) - (a.score || 0));
       save(serverId, { ecosystem: eco, packages: pkgs.length, items, truncated: hits.size > MAX_VULNS, old_kernels: pkgs.oldKernels || [] }, srv.packages_at);
     }
   }
 
   function summarize_(items, error) {
-    const count = (fix, sev) => items.filter(i => !!i.fixed === fix && (!sev || sev.includes(i.severity))).length;
-    return { error: error || null, old_kernels: (arguments[2] || []).length, fixable: count(true), fixable_high: count(true, ['critical', 'high']), fixable_critical: count(true, ['critical']),
-      unfixed: count(false), unfixed_high: count(false, ['critical', 'high']) };
+    const has = (list, sev) => list.filter(i => !sev || sev.includes(i.severity)).length;
+    const now_ = items.filter(i => i.available), waiting = items.filter(i => i.fixed && !i.available), none = items.filter(i => !i.fixed);
+    return { error: error || null, old_kernels: (arguments[2] || []).length,
+      fixable: has(now_), fixable_high: has(now_, ['critical', 'high']), fixable_critical: has(now_, ['critical']),
+      waiting: has(waiting), waiting_high: has(waiting, ['critical', 'high']),
+      unfixed: has(none), unfixed_high: has(none, ['critical', 'high']) };
   }
   function save(serverId, data, packagesAt) {
     db.prepare('INSERT OR REPLACE INTO server_vulns(server_id,data,at,packages_at,summary) VALUES(?,?,?,?,?)')
@@ -239,4 +260,4 @@ function create({ db, now, config, features }) {
   };
 }
 
-module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom, slim, compareDebVersion };
+module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom, slim, compareDebVersion, markAvailable };

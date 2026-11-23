@@ -293,7 +293,7 @@ describe('vulnerabilidades (OSV falsa)', () => {
     await setupAdmin(hub);
     srv = await enrollServer(hub);
     await srv.report({ agent_version: '0', metrics: metrics(), results: [], inventory: { system: { os_id: 'ubuntu', os_version_id: '24.04', os: 'Ubuntu 24.04.5 LTS' }, actions: [], actions_mode: 'all',
-      packages: { manager: 'apt', updates: [], installed: [['libssl3', '3.0.13-1', 'openssl', '3.0.13-1'], ['openssl', '3.0.13-1'], ['bash', '5.2-1']] } } });
+      packages: { manager: 'apt', updates: [{ name: 'libssl3', new: '3.0.13-9', current: '3.0.13-1', security: true }], installed: [['libssl3', '3.0.13-1', 'openssl', '3.0.13-1'], ['openssl', '3.0.13-1'], ['bash', '5.2-1']] } } });
   });
   after(() => { hub.stop(); osv.close(); });
 

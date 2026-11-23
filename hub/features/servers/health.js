@@ -82,8 +82,9 @@ function evaluate(srv, now = Date.now() / 1000) {
   if (vu && !vu.error) {
     if (vu.fixable) {
       add(vu.fixable_critical ? 'crit' : vu.fixable_high ? 'warn' : 'info', 'segurança',
-        `${vu.fixable} vulnerabilidade(s) com correção disponível${vu.fixable_high ? ` (${vu.fixable_high} alta(s) ou crítica(s))` : ''}.`, 'cve_fixable', 'vulns');
+        `${vu.fixable} vulnerabilidade(s) com correção pronta para instalar${vu.fixable_high ? ` (${vu.fixable_high} alta(s) ou crítica(s))` : ''}.`, 'cve_fixable', 'vulns');
     }
+    if (vu.waiting_high) add('info', 'segurança', `${vu.waiting_high} vulnerabilidade(s) alta(s) ou crítica(s) já corrigida(s) pela distribuição, aguardando chegar a este servidor.`, 'cve_waiting', 'vulns');
     if (vu.unfixed_high) add('info', 'segurança', `${vu.unfixed_high} vulnerabilidade(s) alta(s) ou crítica(s) ainda sem correção da distribuição.`, 'cve_unfixed', 'vulns');
   }
 
