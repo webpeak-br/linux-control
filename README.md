@@ -42,6 +42,18 @@ O Linux é uma tela preta para a maioria das pessoas. O Linux Control mostra, em
 
 Requisitos: **Node.js 22.13+** (recomendado 24) ou Docker.
 
+### Script automático (Ubuntu/Debian, com HTTPS)
+
+Num servidor limpo, como root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/webpeak-br/linux-control/main/deploy/install-hub.sh -o install-hub.sh
+sh install-hub.sh painel.seudominio.com                 # Let's Encrypt automático
+sh install-hub.sh painel.seudominio.com --cloudflare    # domínio com proxy da Cloudflare (SSL Full)
+```
+
+Instala Node.js 24, Caddy (HTTPS), serviço systemd, firewall e gera a senha do admin em `/root/linux-control-admin-password.txt`. Rodar de novo atualiza o código.
+
 ### Com Docker
 
 ```bash
