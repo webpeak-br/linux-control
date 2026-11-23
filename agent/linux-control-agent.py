@@ -1416,6 +1416,9 @@ def run_install_app(app_id):
     return lambda p, state: run_app(False)({"app": app_id}, state)
 
 
+F2B_JAIL = "/etc/fail2ban/jail.d/zz-linux-control.local"
+
+
 def run_fail2ban(p, state):
     if not which("fail2ban-client"):
         rc, out = run_app(False)({"app": "fail2ban"}, state)
@@ -1426,16 +1429,34 @@ def run_fail2ban(p, state):
     ports = ",".join(str(x) for x in sorted(ssh_ports()))
     backend = "" if os.path.exists("/var/log/auth.log") or os.path.exists("/var/log/secure") else "backend = systemd\n"
     os.makedirs("/etc/fail2ban/jail.d", exist_ok=True)
-    with open("/etc/fail2ban/jail.d/linux-control.conf", "w") as f:
+    # .local é lido por último: vale mesmo se um jail.local do servidor tiver desligado o [sshd].
+    old = "/etc/fail2ban/jail.d/linux-control.conf"
+    if os.path.exists(old):
+        os.remove(old)
+    with open(F2B_JAIL, "w") as f:
         # journalmatch inclui sshd-session: no OpenSSH 9.8+ (Ubuntu 24.10+) é esse processo que registra os logins.
         f.write("# Gerenciado pelo Linux Control\n[sshd]\nenabled = true\nport = %s\n%smaxretry = 5\nfindtime = 600\nbantime = 3600\n"
                 "ignoreip = 127.0.0.1/8 ::1\njournalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd + _COMM=sshd-session\n"
                 % (ports, backend))
-    rc, out2 = run(["/bin/sh", "-c", "systemctl enable fail2ban >/dev/null 2>&1; systemctl restart fail2ban && sleep 2 && fail2ban-client status sshd"], timeout=60)
+    rc, out2 = run(["/bin/sh", "-c", "systemctl enable fail2ban >/dev/null 2>&1; systemctl restart fail2ban"], timeout=90)
+    if rc != 0:
+        return rc, out + "\nO Fail2ban não reiniciou:\n" + out2 + "\n" + run(["journalctl", "-u", "fail2ban", "-n", "30", "--no-pager"], timeout=20)[1]
+    # Com muito log para ler, o jail pode levar alguns segundos para aparecer.
+    status = None
+    for _ in range(20):
+        time.sleep(1)
+        status = fail2ban_sshd()
+        if status:
+            break
     state["force_inventory"] = True
-    return rc, (out[-2000:] + "\nProteção do SSH ligada (5 tentativas em 10 min = bloqueio de 1 h).\n"
-                "Os contadores começam do zero agora; o painel passa a mostrar os IPs bloqueados nos próximos minutos.\n\n" + out2)
-
+    if not status:
+        jails = run(["fail2ban-client", "status"], timeout=10)[1].strip()
+        log = run(["/bin/sh", "-c", "grep -iE 'error|sshd' /var/log/fail2ban.log 2>/dev/null | tail -15"], timeout=10)[1].strip()
+        return 1, (out + "\nO jail do SSH não subiu em 20 s. Jails ativos:\n%s\n\nÚltimas linhas relevantes do fail2ban.log:\n%s\n\n"
+                   "Confira se algum arquivo em /etc/fail2ban/jail.d/*.local ou jail.local redefine o [sshd]." % (jails, log or "(vazio)"))
+    return 0, (out[-2000:] + "\nProteção do SSH ligada (5 tentativas em 10 min = bloqueio de 1 h), configuração em %s.\n"
+               "Os contadores começam do zero agora; o painel passa a mostrar os IPs bloqueados nos próximos minutos.\n\n"
+               "Jail sshd: %d falha(s), %d IP(s) bloqueado(s)." % (F2B_JAIL, status["failed_total"], status["banned_now"]))
 
 def public_listeners():
     """Portas escutando fora do loopback: o firewall novo precisa mantê-las abertas para nada parar de funcionar.

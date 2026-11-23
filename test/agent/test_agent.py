@@ -353,3 +353,30 @@ class AcoesDeEstado(unittest.TestCase):
     def test_falha_ao_conferir_estado_nao_derruba_o_catalogo(self):
         a = {"id": "x.y", "done": lambda: 1 / 0}
         self.assertEqual(agent.action_state(a), {"done": False, "done_label": "já aplicado"})
+
+
+class Fail2banInstalacao(unittest.TestCase):
+    def test_jail_que_nao_sobe_vira_falha_com_explicacao(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(agent, "F2B_JAIL", os.path.join(d, "zz.local")), \
+             mock.patch.object(agent.os, "makedirs"), mock.patch.object(agent.os.path, "exists", return_value=False), \
+             mock.patch.object(agent, "which", return_value="/usr/bin/fail2ban-client"), \
+             mock.patch.object(agent, "ssh_ports", return_value={22}), mock.patch.object(agent.time, "sleep"), \
+             mock.patch.object(agent, "fail2ban_sshd", return_value=None), \
+             mock.patch.object(agent, "run", return_value=(0, "Jail list:\tsippro-anon")):
+            rc, out = agent.run_fail2ban({}, {})
+            self.assertIn("enabled = true", open(os.path.join(d, "zz.local")).read())
+        self.assertEqual(rc, 1)
+        self.assertIn("sippro-anon", out)
+
+    def test_jail_que_sobe_informa_os_contadores(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(agent, "F2B_JAIL", os.path.join(d, "zz.local")), \
+             mock.patch.object(agent.os, "makedirs"), mock.patch.object(agent.os.path, "exists", return_value=True), \
+             mock.patch.object(agent.os, "remove"), mock.patch.object(agent, "which", return_value="/usr/bin/fail2ban-client"), \
+             mock.patch.object(agent, "ssh_ports", return_value={22}), mock.patch.object(agent.time, "sleep"), \
+             mock.patch.object(agent, "fail2ban_sshd", return_value={"active": True, "banned_now": 2, "banned_total": 2, "failed_total": 9}), \
+             mock.patch.object(agent, "run", return_value=(0, "")):
+            rc, out = agent.run_fail2ban({}, {})
+        self.assertEqual(rc, 0)
+        self.assertIn("2 IP(s) bloqueado(s)", out)
