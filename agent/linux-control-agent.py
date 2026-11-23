@@ -345,6 +345,7 @@ def system_info():
     return {
         "hostname": socket.gethostname(),
         "os": osr.get("PRETTY_NAME") or platform.platform(),
+        "os_id": osr.get("ID", ""), "os_version_id": osr.get("VERSION_ID", ""),
         "kernel": platform.release(),
         "arch": platform.machine(),
         "cpu_model": cpu_model,
@@ -618,8 +619,10 @@ def installed_packages(pm):
     """[[nome, versão], ...] dos pacotes instalados."""
     items = []
     if pm == "apt":
-        _, out = run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Package}\t${Version}\n"], timeout=30, merge=False)
-        items = [f[1:] for f in (l.split("\t") for l in out.splitlines()) if len(f) == 3 and f[0].startswith("ii")]
+        # Pacote-fonte e versão vão junto: os avisos de segurança do Debian/Ubuntu são por pacote-fonte.
+        _, out = run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Package}\t${Version}\t${source:Package}\t${source:Version}\n"], timeout=30, merge=False)
+        items = [f[1:3] + ([f[3], f[4]] if (f[3], f[4]) != (f[1], f[2]) else [])
+                 for f in (l.split("\t") for l in out.splitlines()) if len(f) == 5 and f[0].startswith("ii")]
     elif pm in ("dnf", "yum"):
         _, out = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"], timeout=30, merge=False)
         items = [l.split("\t") for l in out.splitlines() if "\t" in l]
@@ -2562,6 +2565,24 @@ APP_RECIPES[:] = json.loads(r'''[
 APP_BY_ID.update({r["id"]: r for r in APP_RECIPES})
 
 
+AGENT_FILES = ("/opt/linux-control/linux-control-agent.py", "/opt/linux-control/linux-control-agent.py.bak")
+
+
+def run_agent_uninstall(p, state):
+    """Remove o agente deste servidor. O resultado volta ao painel antes: a remoção roda 20 s depois,
+    fora do processo do agente (systemd-run), e não toca nos aplicativos instalados pelo painel."""
+    script = ("sleep 20; systemctl disable --now linux-control-agent; rm -f /etc/systemd/system/linux-control-agent.service; "
+              "systemctl daemon-reload; rm -f %s; rmdir /opt/linux-control 2>/dev/null; rm -rf /etc/linux-control" % " ".join(AGENT_FILES))
+    if which("systemd-run"):
+        rc, out = run(["systemd-run", "--unit", "lctl-uninstall-%d" % int(time.time()), "--collect", "/bin/sh", "-c", script], timeout=30)
+    else:
+        rc, out = run(["/bin/sh", "-c", "nohup /bin/sh -c '%s' >/dev/null 2>&1 &" % script], timeout=30)
+    if rc != 0:
+        return rc, "Não consegui agendar a remoção:\n" + out
+    keep = " Os aplicativos instalados pelo painel continuam funcionando." if os.path.isdir(STACKS_DIR) and os.listdir(STACKS_DIR) else ""
+    return 0, "O agente será removido em 20 segundos (serviço, arquivos e configuração).%s" % keep
+
+
 NTP_SH = ("if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?|ntpd?)\\.service'; then "
           "echo 'Nenhum serviço de hora encontrado; instalando o chrony.'; "
           "if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else dnf -y -q install chrony || yum -y -q install chrony; fi; "
@@ -2630,9 +2651,9 @@ ACTIONS = [
      "sh": "docker system df; docker system prune -af; docker builder prune -af; echo; docker system df"},
     {"id": "security.updates", "group": "Segurança", "label": "Ver atualizações pendentes", "level": "read", "timeout": 300,
      "desc": "Atualiza o índice de pacotes e lista o que pode ser atualizado.", "sh": PKG_SH["updates"]},
-    {"id": "security.apply_security", "fixes": ["updates_security"], "group": "Segurança", "label": "Aplicar atualizações de segurança", "level": "change", "timeout": 1800,
+    {"id": "security.apply_security", "fixes": ["updates_security", "cve_fixable"], "group": "Segurança", "label": "Aplicar atualizações de segurança", "level": "change", "timeout": 1800,
      "desc": "Instala somente as atualizações de segurança.", "sh": PKG_SH["security"]},
-    {"id": "security.apply_all", "fixes": ["updates_available", "updates_security"], "group": "Segurança", "label": "Aplicar todas as atualizações", "level": "danger", "confirm": True, "timeout": 3600,
+    {"id": "security.apply_all", "fixes": ["updates_available", "updates_security", "cve_fixable"], "group": "Segurança", "label": "Aplicar todas as atualizações", "level": "danger", "confirm": True, "timeout": 3600,
      "desc": "Atualiza todos os pacotes do sistema. Pode reiniciar serviços.", "sh": PKG_SH["all"]},
     {"id": "security.failed_logins", "fixes": ["ssh_bruteforce"], "group": "Segurança", "label": "Tentativas de invasão SSH", "level": "read",
      "desc": "Últimas tentativas de login SSH que falharam e os IPs de origem.", "run": run_failed_logins},
@@ -2776,6 +2797,8 @@ ACTIONS = [
      "desc": "Força o agente a recoletar serviços, pacotes, segurança e software."},
     {"id": "system.timezone", "group": "Sistema", "label": "Mudar fuso horário", "level": "admin", "run": run_timezone,
      "desc": "Define o fuso horário do servidor.", "fields": [f_select("timezone", "Fuso horário", TIMEZONES)]},
+    {"id": "agent.uninstall", "group": "Sistema", "label": "Desinstalar o agente", "level": "danger", "confirm": True, "run": run_agent_uninstall,
+     "placement": "agent", "desc": "Remove o agente deste servidor (o painel para de receber dados). Aplicativos instalados pelo painel continuam."},
     {"id": "system.reboot", "fixes": ["reboot_required"], "group": "Sistema", "label": "Reiniciar servidor", "level": "danger", "confirm": True,
      "desc": "Reinicia o servidor em 1 minuto.",
      "sh": "shutdown -r +1 'Reinício solicitado pelo Linux Control' && echo 'Reinício agendado para daqui a 1 minuto.'"},

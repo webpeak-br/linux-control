@@ -25,8 +25,13 @@ fi
 if [ "$TOKEN" = "--uninstall" ]; then
   systemctl disable --now linux-control-agent 2>/dev/null || true
   rm -f "$UNIT"; systemctl daemon-reload 2>/dev/null || true
-  rm -rf "$BIN_DIR" "$CONF_DIR"
-  echo "Linux Control Agent removido."; exit 0
+  # Só os arquivos do agente: aplicativos instalados pelo painel (stacks/ e proxy/) continuam funcionando.
+  rm -f "$BIN_DIR/linux-control-agent.py" "$BIN_DIR/linux-control-agent.py.bak"
+  rmdir "$BIN_DIR" 2>/dev/null || true
+  rm -rf "$CONF_DIR"
+  echo "Linux Control Agent removido."
+  [ -d "$BIN_DIR/stacks" ] && echo "Os aplicativos instalados pelo painel continuam em $BIN_DIR/stacks."
+  exit 0
 fi
 
 if [ -z "$TOKEN" ]; then

@@ -1,7 +1,7 @@
 import { api } from '../../api.js';
 import { esc } from '../../util.js';
 import { copyBox, bindCopy, toast } from '../../ui.js';
-import { loadAgentCommands } from '../../actions.js';
+import { loadAgentCommands, placementButtons } from '../../actions.js';
 
 export const label = 'Configurações';
 let agent = null, commands = null;
@@ -21,7 +21,12 @@ export function body(s) {
       <p class="small">Versão instalada: <b>${esc(agent.installed || '—')}</b> · disponível no painel: <b>${esc(agent.available)}</b> ${status}</p>
       <p class="muted small">Gere um novo token para (re)instalar o agente. O token anterior deixa de funcionar na hora.</p>
       <button class="btn" id="rt">Gerar novo comando de instalação</button><div id="rtout" class="mt"></div>
-      <p class="muted small mt">Para desinstalar, rode no servidor:</p>${copyBox(commands.uninstall)}</div></div>
+      </div></div>
+    <div class="panel mt"><h3>Desinstalação rápida do agente</h3>
+      ${placementButtons(s, 'agent') ? `<p class="small">Pelo painel, com um clique (o servidor precisa estar online):</p><div class="fix">${placementButtons(s, 'agent')}</div>` : ''}
+      <p class="small mt">Ou rode no servidor:</p>${copyBox(commands.uninstall)}
+      <p class="muted small">Remove o serviço, os arquivos e a configuração do agente. Aplicativos instalados pelo painel continuam funcionando.
+      Depois, use <b>Remover do painel</b> abaixo para apagar o histórico.</p></div>
     <div class="panel mt"><h3>Remover servidor</h3><p class="muted small">Remove o servidor, o histórico e as execuções do painel. O agente instalado passa a ser recusado.</p>
       <button class="btn danger" id="rm">Remover do painel</button></div>`;
 }

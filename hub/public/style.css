@@ -291,3 +291,4 @@ details summary { cursor: pointer; color: var(--brand2); }
 .app-head b { display: block; overflow-wrap: anywhere; }
 .app-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 12px; }
 .app-foot .pill { white-space: nowrap; }
+.ok-text { color: var(--ok); } .warn-text { color: var(--warn); } .crit-text { color: var(--crit); }

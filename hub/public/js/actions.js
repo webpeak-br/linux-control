@@ -38,7 +38,7 @@ export function rowButtons(server, target, item) {
 // Ações que o agente pede para mostrar no topo de uma aba (ex.: "Criar usuário" na aba Usuários).
 export function placementButtons(server, place) {
   return catalog(server).filter(a => a.placement === place)
-    .map(a => { const c = activeFor(a.id); return c ? runningBtn(c) : `<button class="btn sm primary" data-run="${esc(a.id)}">+ ${esc(a.label)}</button>`; }).join(' ');
+    .map(a => { const c = activeFor(a.id); return c ? runningBtn(c) : `<button class="btn sm ${isDangerous(a) ? 'danger' : 'primary'}" data-run="${esc(a.id)}">${isDangerous(a) ? '' : '+ '}${esc(a.label)}</button>`; }).join(' ');
 }
 
 // Botões ao lado de um problema do diagnóstico: as ações que declaram o código dele em "fixes".

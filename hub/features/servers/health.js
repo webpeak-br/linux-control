@@ -77,6 +77,16 @@ function evaluate(srv, now = Date.now() / 1000) {
   if (dh.io_errors_24h > 0) add('crit', 'discos', `${dh.io_errors_24h} erro(s) de leitura/gravação de disco no log do kernel (24h).`, 'disk_io_errors', 'disks');
   if (dh.smartctl === false && dh.virtual === false) add('info', 'discos', 'Instale o monitor de disco para acompanhar setores defeituosos e desgaste.', 'smart_missing', 'disks');
 
+  // Vulnerabilidades conhecidas (CVE) nos pacotes instalados.
+  const vu = srv.vulns;
+  if (vu && !vu.error) {
+    if (vu.fixable) {
+      add(vu.fixable_critical ? 'crit' : vu.fixable_high ? 'warn' : 'info', 'segurança',
+        `${vu.fixable} vulnerabilidade(s) com correção disponível${vu.fixable_high ? ` (${vu.fixable_high} alta(s) ou crítica(s))` : ''}.`, 'cve_fixable', 'vulns');
+    }
+    if (vu.unfixed_high) add('info', 'segurança', `${vu.unfixed_high} vulnerabilidade(s) alta(s) ou crítica(s) ainda sem correção da distribuição.`, 'cve_unfixed', 'vulns');
+  }
+
   const sec = inv.security || {};
   if (sec.reboot_required) add('warn', 'sistema', 'Reinício pendente para concluir atualizações.', 'reboot_required');
   if (sys.ntp_synced === false) add('warn', 'sistema', 'Relógio não sincronizado (NTP).', 'ntp_off');

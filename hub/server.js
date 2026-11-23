@@ -9,7 +9,7 @@ const { secretBox } = require('./core/crypto');
 const { HttpError, send, readBody, requestInfo, createRouter, serveStatic } = require('./core/http');
 
 // Ordem importa só para as migrações (tabelas referenciadas vêm antes).
-const FEATURES = ['audit', 'auth', 'servers', 'commands', 'updates', 'agents', 'alerts', 'license', 'keys', 'terminal'];
+const FEATURES = ['audit', 'auth', 'servers', 'vulns', 'commands', 'updates', 'agents', 'alerts', 'license', 'keys', 'terminal'];
 const CSRF_HEADER = 'x-lctl';
 
 function build(cfg = config) {

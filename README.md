@@ -115,6 +115,7 @@ painel.seudominio.com {
 | `LCTL_TELEMETRY` | `1` | `0` não envia registro nem heartbeat ao servidor de licenças |
 | `LCTL_LICENSE_URL` | (vazio) | Servidor de licenças que recebe o registro e o heartbeat; vazio mantém o registro só local |
 | `LCTL_RELEASES_URL` | (GitHub) | Onde o painel procura versões novas; vazio desliga a verificação |
+| `LCTL_CVE` | `1` | `0` não consulta vulnerabilidades (CVE) dos pacotes na OSV.dev |
 | `LCTL_GEOIP` | `1` | `0` não consulta a localização do IP público dos servidores (ipinfo.io) |
 | `LCTL_GEOIP_URL` | `https://ipinfo.io/{ip}/json` | Outro serviço de localização no mesmo formato (`{ip}` é trocado pelo IP) |
 
@@ -157,7 +158,7 @@ Em **Configurações → Alertas por e-mail**, informe o SMTP da sua empresa (se
 
 ## Licença e privacidade
 
-O código é [MIT](LICENSE). Cada instalação recebe uma licença community gratuita ao ser registrada. O registro envia nome, e-mail, empresa, um identificador aleatório da instalação, a versão e quantos servidores ela monitora, e uma vez por dia o painel envia um heartbeat com versão e quantidade de servidores. Dos servidores monitorados, só o IP público sai do painel, para o ipinfo.io, para mostrar cidade, país e operadora (desligue com `LCTL_GEOIP=0`). O datacenter é lido pelo agente no serviço de metadados do próprio provedor, sem terceiros. Com `LCTL_TELEMETRY=0`, nada é enviado ao servidor de licenças.
+O código é [MIT](LICENSE). Cada instalação recebe uma licença community gratuita ao ser registrada. O registro envia nome, e-mail, empresa, um identificador aleatório da instalação, a versão e quantos servidores ela monitora, e uma vez por dia o painel envia um heartbeat com versão e quantidade de servidores. Dos servidores monitorados saem do painel só o IP público, para o ipinfo.io, e o nome e a versão dos pacotes instalados, para a OSV.dev (consulta de vulnerabilidades; desligue com `LCTL_CVE=0`); o IP é usado para mostrar cidade, país e operadora (desligue com `LCTL_GEOIP=0`). O datacenter é lido pelo agente no serviço de metadados do próprio provedor, sem terceiros. Com `LCTL_TELEMETRY=0`, nada é enviado ao servidor de licenças.
 
 ## Desenvolvimento
 

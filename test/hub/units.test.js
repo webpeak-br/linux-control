@@ -119,3 +119,31 @@ test('tentativas de SSH com Fail2ban ativo viram informação, sem botão de ins
   assert.match(p.text, /3 IP\(s\) bloqueado/);
 });
 
+
+test('vulnerabilidades: nota CVSS 3.1, ecossistema e resumo do aviso OSV', () => {
+  const { cvss3Score, ecosystemOf, queriesFrom, summarize } = require('../../hub/features/vulns');
+  assert.equal(cvss3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'), 9.8);
+  assert.equal(cvss3Score('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N'), 7.5);
+  assert.equal(cvss3Score('CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H'), 8.8);
+  assert.equal(ecosystemOf({ os_id: 'ubuntu', os_version_id: '24.04', os: 'Ubuntu 24.04.5 LTS' }), 'Ubuntu:24.04:LTS');
+  assert.equal(ecosystemOf({ os_id: 'debian', os_version_id: '12' }), 'Debian:12');
+  assert.equal(ecosystemOf({ os_id: 'arch', os_version_id: 'x' }), null);
+  // libssl3 e openssl vêm do mesmo pacote-fonte: uma consulta só.
+  const q = queriesFrom([['libssl3', '3.0.2-0ubuntu1.10', 'openssl', '3.0.2-0ubuntu1.10'], ['openssl', '3.0.2-0ubuntu1.10'], ['bash', '5.1-6']], 'Ubuntu:22.04:LTS');
+  assert.equal(q.length, 2);
+  assert.deepEqual(q.find(x => x.name === 'openssl').binaries, ['libssl3', 'openssl']);
+  const v = { id: 'UBUNTU-CVE-2023-5363', upstream: ['CVE-2023-5363'], summary: 'Issue summary: A bug in IV lengths.',
+    severity: [{ type: 'CVSS_V3', score: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N' }, { type: 'Ubuntu', score: 'medium' }],
+    affected: [{ package: { name: 'openssl', ecosystem: 'Ubuntu:22.04:LTS' }, ranges: [{ type: 'ECOSYSTEM', events: [{ introduced: '0' }, { fixed: '3.0.2-0ubuntu1.12' }] }] }] };
+  const s = summarize(v, q.find(x => x.name === 'openssl'), 'Ubuntu:22.04:LTS');
+  assert.deepEqual([s.cve, s.severity, s.score, s.fixed, s.summary], ['CVE-2023-5363', 'medium', 7.5, '3.0.2-0ubuntu1.12', 'A bug in IV lengths.']);
+  assert.equal(s.url, 'https://ubuntu.com/security/CVE-2023-5363');
+});
+
+test('vulnerabilidades com correção entram no diagnóstico com o código que o botão Resolver usa', () => {
+  const issues = evaluate({ last_seen: now, metrics: {}, inventory: {}, vulns: { fixable: 12, fixable_high: 3, fixable_critical: 1, unfixed: 40, unfixed_high: 2 } }, now).issues;
+  const fix = issues.find(i => i.code === 'cve_fixable');
+  assert.equal(fix.level, 'crit');
+  assert.equal(fix.see, 'vulns');
+  assert.equal(issues.find(i => i.code === 'cve_unfixed').level, 'info');
+});

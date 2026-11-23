@@ -25,6 +25,8 @@ const config = {
   telemetry: env.LCTL_TELEMETRY !== '0',
   releasesUrl: env.LCTL_RELEASES_URL || pkg.linuxControl.releasesUrl,
   // Localização do IP dos servidores. LCTL_GEOIP=0 desliga ({ip} é trocado pelo IP consultado).
+  // Vulnerabilidades (CVE) pela base pública OSV.dev. LCTL_CVE=0 desliga.
+  cveUrl: env.LCTL_CVE === '0' ? '' : (env.LCTL_CVE_URL || 'https://api.osv.dev'),
   geoipUrl: env.LCTL_GEOIP === '0' ? '' : (env.LCTL_GEOIP_URL || 'https://ipinfo.io/{ip}/json'),
   publicDir: path.join(HUB_DIR, 'public'),
   agentDir: AGENT_DIR,

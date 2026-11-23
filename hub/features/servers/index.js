@@ -101,7 +101,13 @@ function create({ db, now, config, features }) {
     if (!r) throw new HttpError(404, 'Servidor não encontrado.');
     return r;
   }
-  const withGeo = srv => { srv.geo = geoip.forServer(srv); return srv; };
+  const withGeo = srv => {
+    srv.geo = geoip.forServer(srv);
+    // O resumo de vulnerabilidades entra no diagnóstico (a análise em si fica em features/vulns).
+    srv.vulns = features.vulns ? features.vulns.summary(srv.id) : null;
+    if (srv.vulns) srv.health = evaluate(srv);
+    return srv;
+  };
   const get = id => withGeo(fromRow(row(id)));
   const all = () => db.prepare('SELECT * FROM servers ORDER BY name COLLATE NOCASE').all().map(r => withGeo(fromRow(r)));
 
