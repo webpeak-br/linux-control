@@ -1359,7 +1359,7 @@ PKG_SH = {
                 "elif command -v apt-get >/dev/null; then apt-get update -qq && apt list --upgradable 2>/dev/null | grep -- -security | cut -d/ -f1 | xargs -r env DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade; "
                 "elif command -v dnf >/dev/null; then dnf -y upgrade --security; elif command -v yum >/dev/null; then yum -y update --security; fi; "
                 "[ -f /var/run/reboot-required ] && echo '>> REINÍCIO NECESSÁRIO' || true",
-    "all": "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; "
+    "all": "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y --with-new-pkgs -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; apt list --upgradable 2>/dev/null | grep -q upgradable && { echo; echo 'Ainda pendente (exige remover pacotes; faça manualmente):'; apt list --upgradable 2>/dev/null | tail -n +2; }; "
            "elif command -v dnf >/dev/null; then dnf -y upgrade; elif command -v yum >/dev/null; then yum -y update; elif command -v apk >/dev/null; then apk upgrade; fi; "
            "[ -f /var/run/reboot-required ] && echo '>> REINÍCIO NECESSÁRIO' || true",
     "clean": "df -h / | tail -1; if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge && apt-get clean; "
@@ -1573,8 +1573,6 @@ def execute_action(cmd, mode, state):
     params, err = validate_params(a, cmd.get("params"))
     if err:
         return 2, err
-    if a["level"] != "read":
-        state["force_inventory"] = True  # o diagnóstico do painel reflete a mudança no próximo ciclo
     if "run" in a:
         return a["run"](params, state)
     return run(["/bin/sh", "-c", a["sh"]], timeout=int(a.get("timeout", 120)))
@@ -1658,22 +1656,28 @@ def self_update(conf, info):
     os.execv(sys.executable, [sys.executable, path] + sys.argv[1:])
 
 
+def run_command(cmd, mode, state):
+    """Executa uma ação da fila e devolve o resultado para o hub."""
+    started = time.time()
+    log("executando ação %s (%s)" % (cmd.get("action"), cmd.get("id")))
+    state["busy"] = True
+    try:
+        rc, out = execute_action(cmd, mode, state)
+    except Exception as e:
+        rc, out = 1, "Erro interno do agente: %s" % e
+    state["busy"] = False
+    if (ACTIONS_BY_ID.get(cmd.get("action")) or {}).get("level", "read") != "read":
+        state["force_inventory"] = True  # só depois de terminar: o diagnóstico reflete a mudança no ciclo seguinte
+    if len(out) > MAX_OUTPUT:
+        out = "[saída truncada, mostrando o final]\n" + out[-MAX_OUTPUT:]
+    return {"id": cmd.get("id"), "exit_code": rc, "output": out, "duration": round(time.time() - started, 1)}
+
+
 def worker(q, results, lock, mode, state):
     while True:
-        cmd = q.get()
-        started = time.time()
-        log("executando ação %s (%s)" % (cmd.get("action"), cmd.get("id")))
-        state["busy"] = True
-        try:
-            rc, out = execute_action(cmd, mode, state)
-        except Exception as e:
-            rc, out = 1, "Erro interno do agente: %s" % e
-        state["busy"] = False
-        if len(out) > MAX_OUTPUT:
-            out = "[saída truncada, mostrando o final]\n" + out[-MAX_OUTPUT:]
+        res = run_command(q.get(), mode, state)
         with lock:
-            results.append({"id": cmd.get("id"), "exit_code": rc, "output": out,
-                            "duration": round(time.time() - started, 1)})
+            results.append(res)
 
 
 def main():

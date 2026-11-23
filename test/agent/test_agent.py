@@ -211,9 +211,16 @@ class CorrecoesDoDiagnostico(unittest.TestCase):
 
     def test_toda_acao_que_altera_pede_recoleta_do_inventario(self):
         state = {}
-        with mock.patch.object(agent, "run", return_value=(0, "")):
-            agent.execute_action({"action": "cleanup.tmp", "params": {}}, "all", state)
+        def during(*a, **k):
+            self.assertFalse(state.get("force_inventory"))  # não recoleta enquanto a ação roda
+            return 0, ""
+        with mock.patch.object(agent, "run", side_effect=during), mock.patch.object(agent, "log"):
+            agent.run_command({"action": "cleanup.tmp", "params": {}}, "all", state)
         self.assertTrue(state.get("force_inventory"))
+        state2 = {}
+        with mock.patch.object(agent, "run", return_value=(0, "")), mock.patch.object(agent, "log"):
+            agent.run_command({"action": "health.overview", "params": {}}, "all", state2)
+        self.assertFalse(state2.get("force_inventory"))
 
     def test_correcoes_publicam_os_codigos_que_resolvem(self):
         cat = {a["id"]: a for a in agent.action_catalog("all")}

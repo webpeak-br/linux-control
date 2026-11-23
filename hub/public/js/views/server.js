@@ -32,7 +32,7 @@ export function serverView(root, id, tabName, arg) {
   const tab = TABS[key];
   const ctx = { id, arg, rerender: () => renderBody(), reload: () => load() };
   const goToCommand = cmdId => { location.hash = `#/server/${id}/actions/${cmdId}`; };
-  let server = null;
+  let server = null, lastHtml = '';
 
   root.innerHTML = '<div class="muted">Carregando…</div>';
 
@@ -62,7 +62,11 @@ export function serverView(root, id, tabName, arg) {
         Gere o comando de instalação em <a href="#/server/${id}/settings">Configurações</a>.</p></div>`;
       return;
     }
-    el.innerHTML = tab.body(server, ctx);
+    const html = tab.body(server, ctx);
+    // Sem mudança, não redesenha: trocar os botões no meio de um clique faz o clique se perder.
+    if (fromTimer && html === lastHtml) return;
+    lastHtml = html;
+    el.innerHTML = html;
     bindCopy(el);
     bindRunButtons(el, server, goToCommand);
     if (tab.bind) tab.bind(el, server, ctx);

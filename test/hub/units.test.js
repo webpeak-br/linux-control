@@ -73,3 +73,10 @@ test('problemas do diagnóstico trazem código e, quando há, a aba de detalhe',
   assert.ok(byCode.ssh_password_auth && byCode.firewall_off);
   assert.ok(issues.every(i => /^[a-z_]+$/.test(i.code)));
 });
+
+test('ids de ação com número (fix.fail2ban) passam pelo filtro do catálogo', () => {
+  const src = fs.readFileSync(path.join(__dirname, '../../hub/features/servers/index.js'), 'utf8');
+  const re = new RegExp(src.match(/const ACTION_ID = \/(.+)\/;/)[1]);
+  const agent = fs.readFileSync(path.join(__dirname, '../../agent/linux-control-agent.py'), 'utf8');
+  for (const [, id] of agent.matchAll(/\{"id": "([a-z0-9_]+\.[a-z0-9_]+)"/g)) assert.ok(re.test(id), id);
+});

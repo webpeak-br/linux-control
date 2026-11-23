@@ -21,7 +21,7 @@ const RANGES = { '1h': [3600, 30], '6h': [21600, 120], '24h': [86400, 300], '7d'
 const NAME_MAX = 80;
 
 // O catálogo de ações chega do agente e vira HTML e formulário no painel: só passa o que tem formato conhecido.
-const ACTION_ID = /^[a-z_]+\.[a-z_]+$/;
+const ACTION_ID = /^[a-z_]+\.[a-z0-9_]+$/;
 const FIELD_NAME = /^[a-z_]{1,40}$/;
 const FIELD_TYPES = new Set(['text', 'textarea', 'select', 'bool', 'cron']);
 const TARGETS = new Set(['service', 'container', 'user', 'app', 'cron']);
