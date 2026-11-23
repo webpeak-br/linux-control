@@ -158,3 +158,15 @@ test('vulnerabilidades: o cache guarda só o necessário do aviso', () => {
   assert.equal(s.affected.length, 2);
   assert.equal(summarize(s, { name: 'openssl', version: '3.0.13-0ubuntu3.1' }, 'Ubuntu:24.04:LTS').fixed, '3.0.13-0ubuntu3.5');
 });
+
+test('vulnerabilidades: kernels antigos instalados ficam fora da contagem', () => {
+  const { queriesFrom } = require('../../hub/features/vulns');
+  const q = queriesFrom([
+    ['linux-image-7.0.0-30-generic', '7.0.0-30.30', 'linux-signed', '7.0.0-30.30'], ['linux-modules-7.0.0-30-generic', '7.0.0-30.30', 'linux', '7.0.0-30.30'],
+    ['linux-modules-7.0.0-44-generic', '7.0.0-44.44', 'linux', '7.0.0-44.44'], ['linux-modules-7.0.0-9-generic', '7.0.0-9.9', 'linux', '7.0.0-9.9'],
+    ['linux-firmware', '20260101', 'linux-firmware', '20260101'], ['bash', '5.2-1'],
+  ], 'Ubuntu:26.04:LTS');
+  assert.deepEqual(q.filter(x => x.name === 'linux').map(x => x.version), ['7.0.0-44.44']);
+  assert.deepEqual(q.oldKernels.sort(), ['7.0.0-30.30', '7.0.0-9.9']);
+  assert.ok(q.find(x => x.name === 'linux-firmware') && q.find(x => x.name === 'bash'));
+});

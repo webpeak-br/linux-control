@@ -10,7 +10,9 @@ const migrations = [{ name: 'vulns:1', sql: [
 ] },
 // v0.8.0 guardava o aviso inteiro no cache (pesado); o resumo do diagnóstico passa a ter coluna própria.
 { name: 'vulns:2', sql: ['DELETE FROM vuln_cache'] },
-{ name: 'vulns:3', tolerant: true, sql: ['ALTER TABLE server_vulns ADD COLUMN summary TEXT'] }];
+{ name: 'vulns:3', tolerant: true, sql: ['ALTER TABLE server_vulns ADD COLUMN summary TEXT'] },
+// v0.8.2: kernels antigos fora da contagem; reanalisa tudo.
+{ name: 'vulns:4', sql: ['UPDATE server_vulns SET packages_at = -1'] }];
 const CACHE_SECONDS = 7 * 86400;
 const BATCH = 1000;
 const MAX_VULNS = 5000;
@@ -93,7 +95,31 @@ function queriesFrom(installed, ecosystem) {
     if (!map.has(key)) map.set(key, { name: qName, version: qVersion, binaries: [] });
     map.get(key).binaries.push(name);
   }
-  return [...map.values()];
+  // O Ubuntu/Debian guarda kernels anteriores para emergência. Eles não estão em uso e, contados, inflam o total
+  // com centenas de CVEs já corrigidos no kernel novo: de cada pacote-fonte do kernel fica só a versão mais nova.
+  const all = [...map.values()];
+  const isKernel = q => /^linux/.test(q.name) && q.binaries.every(b => KERNEL_BIN.test(b));
+  const newest = new Map();
+  for (const q of all.filter(isKernel)) {
+    const cur = newest.get(q.name);
+    if (!cur || compareDebVersion(q.version, cur.version) > 0) newest.set(q.name, q);
+  }
+  const old = all.filter(q => isKernel(q) && newest.get(q.name) !== q);
+  const out = all.filter(q => !isKernel(q) || newest.get(q.name) === q);
+  out.oldKernels = old.map(q => q.version);
+  return out;
+}
+
+const KERNEL_BIN = /^linux-(image|modules|headers|tools|buildinfo|cloud-tools|objects|signatures|lib-rust)(-|$)/;
+
+// Comparação aproximada de versões Debian (suficiente para escolher o kernel mais novo).
+function compareDebVersion(a, b) {
+  const pa = String(a).split(/[^0-9]+/).filter(Boolean).map(Number), pb = String(b).split(/[^0-9]+/).filter(Boolean).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
 }
 
 function create({ db, now, config, features }) {
@@ -161,18 +187,18 @@ function create({ db, now, config, features }) {
       }
       const order = Object.fromEntries(SEVERITIES.map((s, i) => [s, i]));
       items.sort((a, b) => (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || order[a.severity] - order[b.severity] || (b.score || 0) - (a.score || 0));
-      save(serverId, { ecosystem: eco, packages: pkgs.length, items, truncated: hits.size > MAX_VULNS }, srv.packages_at);
+      save(serverId, { ecosystem: eco, packages: pkgs.length, items, truncated: hits.size > MAX_VULNS, old_kernels: pkgs.oldKernels || [] }, srv.packages_at);
     }
   }
 
   function summarize_(items, error) {
     const count = (fix, sev) => items.filter(i => !!i.fixed === fix && (!sev || sev.includes(i.severity))).length;
-    return { error: error || null, fixable: count(true), fixable_high: count(true, ['critical', 'high']), fixable_critical: count(true, ['critical']),
+    return { error: error || null, old_kernels: (arguments[2] || []).length, fixable: count(true), fixable_high: count(true, ['critical', 'high']), fixable_critical: count(true, ['critical']),
       unfixed: count(false), unfixed_high: count(false, ['critical', 'high']) };
   }
   function save(serverId, data, packagesAt) {
     db.prepare('INSERT OR REPLACE INTO server_vulns(server_id,data,at,packages_at,summary) VALUES(?,?,?,?,?)')
-      .run(serverId, JSON.stringify(data), now(), packagesAt || 0, JSON.stringify(summarize_(data.items || [], data.error)));
+      .run(serverId, JSON.stringify(data), now(), packagesAt || 0, JSON.stringify(summarize_(data.items || [], data.error, data.old_kernels)));
   }
 
   function stored(serverId) {
@@ -213,4 +239,4 @@ function create({ db, now, config, features }) {
   };
 }
 
-module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom, slim };
+module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom, slim, compareDebVersion };

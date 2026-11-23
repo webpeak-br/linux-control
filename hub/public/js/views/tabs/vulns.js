@@ -57,7 +57,8 @@ export function body(s) {
     </div>
     <div class="panel"><h3>Corrigir <span class="r">${scanBtn}</span></h3>
       <p class="small muted">As correções chegam pelas atualizações da própria distribuição. Depois de aplicar, a análise roda de novo sozinha quando o agente envia a nova lista de pacotes. Algumas correções só valem após reiniciar (kernel, bibliotecas em uso).</p>
-      <div class="fix">${fixBtns || '<span class="small muted">As ações de atualização exigem o agente no modo "all" ou "admin".</span>'}</div></div>
+      <div class="fix">${fixBtns || '<span class="small muted">As ações de atualização exigem o agente no modo "all" ou "admin".</span>'}</div>
+      ${(r.old_kernels || []).length ? `<p class="small mt">Há ${r.old_kernels.length} kernel(s) antigo(s) instalado(s) (${esc(r.old_kernels.join(', '))}). Eles não estão em uso e ficaram fora da contagem; remova com <b>Limpar cache de pacotes</b> na aba Ações.</p>` : ''}</div>
     <div class="toolbar"><span class="seg">
       <button data-vf="fixable" class="${state.filter === 'fixable' ? 'on' : ''}">Com correção (${fix.length})</button>
       <button data-vf="nofix" class="${state.filter === 'nofix' ? 'on' : ''}">Sem correção (${nofix.length})</button>
