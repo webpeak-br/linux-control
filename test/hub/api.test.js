@@ -144,3 +144,19 @@ describe('atualização dos agentes', () => {
     assert.equal((await hub.call('GET', `/api/servers/${srv.id}/agent`)).body.requested, false);
   });
 });
+
+describe('interface', () => {
+  test('HTML aponta para arquivos com a versão no caminho, servidos com cache longo', async () => {
+    const hub = await startHub();
+    try {
+      const v = hub.cfg.version;
+      const html = await fetch(hub.base + '/');
+      assert.equal(html.headers.get('cache-control'), 'no-store');
+      assert.match(await html.text(), new RegExp(`src="/v${v.replace(/\./g, '\\.')}/js/main.js"`));
+      const js = await fetch(`${hub.base}/v${v}/js/main.js`);
+      assert.equal(js.status, 200);
+      assert.match(js.headers.get('cache-control'), /immutable/);
+      assert.equal((await fetch(`${hub.base}/v0.0.0-velha/js/main.js`)).status, 200);
+    } finally { hub.stop(); }
+  });
+});

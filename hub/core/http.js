@@ -99,13 +99,20 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 };
 
-function serveStatic(res, publicDir, pathname) {
-  const rel = pathname === '/' ? '/index.html' : pathname;
-  let file = path.normalize(path.join(publicDir, rel));
-  if (!file.startsWith(publicDir + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-    file = path.join(publicDir, 'index.html');
+// Arquivos da interface ficam sob /v<versão>/: o HTML (nunca guardado em cache) aponta para a versão atual,
+// então CSS e JS podem ficar em cache para sempre e, depois de uma atualização, o navegador busca os novos.
+// Isso vale mesmo atrás de CDNs que impõem cache próprio a arquivos estáticos (ex.: Cloudflare).
+function serveStatic(res, publicDir, pathname, version) {
+  const prefix = `/v${version}`;
+  const versioned = pathname.startsWith(prefix + '/');
+  const file = path.normalize(path.join(publicDir, versioned ? pathname.slice(prefix.length) : pathname));
+  if (!versioned || !file.startsWith(publicDir + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    const html = fs.readFileSync(path.join(publicDir, 'index.html'), 'utf8').replaceAll('__ASSETS__', prefix);
+    res.writeHead(versioned ? 404 : 200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store', ...SECURITY_HEADERS });
+    return res.end(html);
   }
-  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache', ...SECURITY_HEADERS });
+  res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
+    'Cache-Control': 'public, max-age=31536000, immutable', ...SECURITY_HEADERS });
   fs.createReadStream(file).pipe(res);
 }
 

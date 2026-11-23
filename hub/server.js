@@ -28,7 +28,7 @@ function build(cfg = config) {
     const url = new URL(req.url, 'http://localhost');
     const match = router.match(req.method, url.pathname);
     if (!match) {
-      if (req.method === 'GET' && !url.pathname.startsWith('/api/')) return serveStatic(res, cfg.publicDir, url.pathname);
+      if (req.method === 'GET' && !url.pathname.startsWith('/api/')) return serveStatic(res, cfg.publicDir, url.pathname, cfg.version);
       throw new HttpError(404, 'rota não encontrada');
     }
     const { route, params } = match;
