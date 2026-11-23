@@ -286,3 +286,8 @@ details summary { cursor: pointer; color: var(--brand2); }
 .app-icon { width: 34px; height: 34px; border-radius: 8px; background: var(--brand); color: #fff; display: grid; place-items: center; font-weight: 700; flex: none; }
 .warn-box { background: rgba(245,176,65,.08); border: 1px solid rgba(245,176,65,.35); border-radius: 8px; padding: 4px 12px; margin: 10px 0; }
 .copy-name { margin-left: 8px; padding: 2px 8px; vertical-align: middle; }
+.app-card { min-width: 0; }
+.app-head .grow { min-width: 0; }
+.app-head b { display: block; overflow-wrap: anywhere; }
+.app-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 12px; }
+.app-foot .pill { white-space: nowrap; }

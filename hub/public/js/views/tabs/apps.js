@@ -29,11 +29,11 @@ export function body(s) {
   const cards = shown.map(a => {
     const [cls, txt] = LICENSE[a.license] || ['', a.license];
     return `<div class="app-card"><div class="app-head"><span class="app-icon">${esc(a.label.slice(0, 1))}</span>
-      <div class="grow"><b>${esc(a.label)}</b><div class="dim small">${esc(a.category)}</div></div><span class="pill ${cls}">${esc(txt)}</span></div>
+      <div class="grow"><b>${esc(a.label)}</b><div class="dim small">${esc(a.category)}</div></div></div>
       <p class="small">${esc(a.desc)}</p>
       <div class="small dim">${a.kind === 'docker' ? 'Docker · HTTPS automático' : a.kind === 'script' ? 'Instalador oficial' : 'Instalação no sistema'}
         ${a.min_ram_mb ? ` · ${N(a.min_ram_mb) >= 1024 ? `${N(a.min_ram_mb) / 1024} GB` : `${N(a.min_ram_mb)} MB`} de RAM` : ''}${a.dedicated_server ? ' · <b>servidor dedicado</b>' : ''}</div>
-      ${action ? `<button class="btn sm primary mt" data-install="${esc(a.id)}">Instalar</button>` : ''}</div>`;
+      <div class="app-foot">${action ? `<button class="btn sm primary" data-install="${esc(a.id)}">Instalar</button>` : '<span></span>'}<span class="pill ${cls}">${esc(txt)}</span></div></div>`;
   }).join('');
   return `${action ? '' : adminHint(s, 'Instalar aplicativos')}${installed}
     <div class="toolbar"><span class="seg"><button data-cat="" class="${state.category ? '' : 'on'}">Todos</button>${cats.map(c =>
