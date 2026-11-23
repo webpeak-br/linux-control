@@ -94,7 +94,13 @@ function evaluate(srv, now = Date.now() / 1000) {
     if (sshLevel('permitrootlogin', ssh.permitrootlogin) !== 'ok') add('warn', 'segurança', 'SSH permite login direto como root com senha.', 'ssh_root_password', 'security');
     if (sshLevel('passwordauthentication', ssh.passwordauthentication) !== 'ok') add('info', 'segurança', 'SSH aceita login por senha (prefira chaves).', 'ssh_password_auth', 'security');
   }
-  if (sec.failed_logins_24h >= 50) add(sec.failed_logins_24h >= 1000 ? 'warn' : 'info', 'segurança', `${sec.failed_logins_24h} tentativas de login SSH falhas em 24h.`, 'ssh_bruteforce', 'security');
+  // Com o Fail2ban protegendo o SSH, as tentativas viram só informação: os IPs insistentes já são bloqueados.
+  const f2b = sec.fail2ban_sshd;
+  if (sec.failed_logins_24h >= 50 && f2b && f2b.active) {
+    add('info', 'segurança', `${sec.failed_logins_24h} tentativas de login SSH falhas em 24h; Fail2ban ativo (${f2b.banned_now} IP(s) bloqueado(s) agora, ${f2b.banned_total} desde que ligou).`, 'ssh_bruteforce_protected', 'security');
+  } else if (sec.failed_logins_24h >= 50) {
+    add(sec.failed_logins_24h >= 1000 ? 'warn' : 'info', 'segurança', `${sec.failed_logins_24h} tentativas de login SSH falhas em 24h.`, 'ssh_bruteforce', 'security');
+  }
   if (sec.auto_updates === false) add('info', 'segurança', 'Atualizações automáticas de segurança desativadas.', 'auto_updates_off');
 
   for (const c of inv.certificates || []) {

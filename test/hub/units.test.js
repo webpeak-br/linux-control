@@ -107,3 +107,14 @@ test('chaves SSH: só pública, privada é recusada com aviso', () => {
   assert.throws(() => parseKey('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'), /PRIVADA/);
   assert.throws(() => parseKey('ssh-ed25519 curta'), /inválida/);
 });
+
+test('tentativas de SSH com Fail2ban ativo viram informação, sem botão de instalar de novo', () => {
+  const inv = f2b => ({ system: { is_root: true }, security: { failed_logins_24h: 2179, fail2ban_sshd: f2b, ssh: {}, firewall: { active: true } } });
+  const at = f2b => evaluate({ last_seen: now, metrics: {}, inventory: inv(f2b) }, now).issues.find(i => /tentativas/.test(i.text));
+  assert.equal(at(null).code, 'ssh_bruteforce');
+  assert.equal(at(null).level, 'warn');
+  const p = at({ active: true, banned_now: 3, banned_total: 40 });
+  assert.equal(p.code, 'ssh_bruteforce_protected');
+  assert.equal(p.level, 'info');
+  assert.match(p.text, /3 IP\(s\) bloqueado/);
+});

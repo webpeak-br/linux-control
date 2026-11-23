@@ -322,3 +322,14 @@ class CatalogoDinamico(unittest.TestCase):
             self.assertNotIn("fix.smartmontools", {a["id"] for a in agent.action_catalog("all")})
         with mock.patch.object(agent, "which", return_value=None):
             self.assertIn("fix.smartmontools", {a["id"] for a in agent.action_catalog("all")})
+
+
+class Fail2ban(unittest.TestCase):
+    def test_le_contadores_do_jail_sshd(self):
+        out = "Status for the jail: sshd\n|  |- Currently failed:\t4\n|  |- Total failed:\t120\n   |- Currently banned:\t3\n   |- Total banned:\t17\n"
+        with mock.patch.object(agent, "run", return_value=(0, out)):
+            self.assertEqual(agent.fail2ban_sshd(), {"active": True, "banned_now": 3, "banned_total": 17, "failed_total": 120})
+
+    def test_jail_desligado_devolve_none(self):
+        with mock.patch.object(agent, "run", return_value=(255, "Sorry but the jail 'sshd' does not exist")):
+            self.assertIsNone(agent.fail2ban_sshd())

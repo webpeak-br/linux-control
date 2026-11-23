@@ -768,6 +768,15 @@ def firewall_status():
     return {"type": None, "active": False, "summary": ""}
 
 
+def fail2ban_sshd():
+    """Situação do jail sshd do Fail2ban (a saída do fail2ban-client é sempre em inglês)."""
+    rc, out = run(["fail2ban-client", "status", "sshd"], timeout=10, merge=False)
+    if rc != 0:
+        return None
+    num = lambda label: int((re.search(label + r":\s*(\d+)", out) or [0, 0])[1])
+    return {"active": True, "banned_now": num("Currently banned"), "banned_total": num("Total banned"), "failed_total": num("Total failed")}
+
+
 def security():
     sec = {}
     ssh = {}
@@ -793,6 +802,7 @@ def security():
     if which("fail2ban-client"):
         rc, out = run(["fail2ban-client", "status"], timeout=10)
         sec["fail2ban"] = out.strip() if rc == 0 else "instalado, mas não respondeu"
+        sec["fail2ban_sshd"] = fail2ban_sshd()
     sec["reboot_required"] = os.path.exists("/var/run/reboot-required")
     sec["reboot_pkgs"] = read("/var/run/reboot-required.pkgs").split()
     if which("needs-restarting"):
@@ -1407,10 +1417,14 @@ def run_fail2ban(p, state):
     backend = "" if os.path.exists("/var/log/auth.log") or os.path.exists("/var/log/secure") else "backend = systemd\n"
     os.makedirs("/etc/fail2ban/jail.d", exist_ok=True)
     with open("/etc/fail2ban/jail.d/linux-control.conf", "w") as f:
-        f.write("# Gerenciado pelo Linux Control\n[sshd]\nenabled = true\nport = %s\n%smaxretry = 5\nfindtime = 600\nbantime = 3600\nignoreip = 127.0.0.1/8 ::1\n" % (ports, backend))
+        # journalmatch inclui sshd-session: no OpenSSH 9.8+ (Ubuntu 24.10+) é esse processo que registra os logins.
+        f.write("# Gerenciado pelo Linux Control\n[sshd]\nenabled = true\nport = %s\n%smaxretry = 5\nfindtime = 600\nbantime = 3600\n"
+                "ignoreip = 127.0.0.1/8 ::1\njournalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd + _COMM=sshd-session\n"
+                % (ports, backend))
     rc, out2 = run(["/bin/sh", "-c", "systemctl enable fail2ban >/dev/null 2>&1; systemctl restart fail2ban && sleep 2 && fail2ban-client status sshd"], timeout=60)
     state["force_inventory"] = True
-    return rc, out[-2000:] + "\nProteção do SSH ligada (5 tentativas em 10 min = bloqueio de 1 h).\n" + out2
+    return rc, (out[-2000:] + "\nProteção do SSH ligada (5 tentativas em 10 min = bloqueio de 1 h).\n"
+                "Os contadores começam do zero agora; o painel passa a mostrar os IPs bloqueados nos próximos minutos.\n\n" + out2)
 
 
 def public_listeners():
