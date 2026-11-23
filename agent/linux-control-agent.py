@@ -1324,7 +1324,9 @@ def self_update(conf, info):
         log("atualização ignorada: sem permissão de escrita em %s" % os.path.dirname(path))
         return
     url = conf["HUB_URL"].rstrip("/") + "/agent/linux-control-agent.py"
-    with urlrequest.urlopen(urlrequest.Request(url), timeout=60, context=tls_context(conf, url)) as r:
+    # Mesmo User-Agent do relatório: proxies como a Cloudflare bloqueiam o padrão do Python.
+    req = urlrequest.Request(url, headers={"User-Agent": "linux-control-agent/" + VERSION})
+    with urlrequest.urlopen(req, timeout=60, context=tls_context(conf, url)) as r:
         code = r.read()
     if hashlib.sha256(code).hexdigest() != info.get("sha256"):
         log("atualização recusada: hash não confere")
