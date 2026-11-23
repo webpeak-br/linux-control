@@ -638,7 +638,8 @@ def security():
     if rc == 0:
         for line in out.splitlines():
             k, _, v = line.partition(" ")
-            if k in ("port", "permitrootlogin", "passwordauthentication", "pubkeyauthentication"):
+            k = k.lower()  # OpenSSH 10 imprime as chaves com maiúsculas (Port, PermitRootLogin)
+            if k in ("port", "permitrootlogin", "passwordauthentication", "pubkeyauthentication") and k not in ssh:
                 ssh[k] = v
     else:
         for line in read("/etc/ssh/sshd_config").splitlines():
@@ -979,7 +980,7 @@ APPS = [
      "dnf": ["certbot", "python3-certbot-nginx"]},
     {"id": "fail2ban", "label": "Fail2ban", "desc": "Bloqueia IPs que tentam invadir por força bruta.", "apt": ["fail2ban"], "dnf": ["fail2ban"], "service": "fail2ban"},
     {"id": "ufw", "label": "Firewall UFW", "desc": "Instala e ativa o firewall liberando o SSH (as demais portas ficam fechadas).",
-     "apt": ["ufw"], "dnf": ["ufw"], "post": "P=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'); ufw allow ${P:-22}/tcp; ufw --force enable && ufw status verbose"},
+     "apt": ["ufw"], "dnf": ["ufw"], "post": "P=$(sshd -T 2>/dev/null | awk 'tolower($1)==\"port\"{print $2; exit}'); ufw allow ${P:-22}/tcp; ufw --force enable && ufw status verbose"},
     {"id": "autoupdates", "label": "Atualizações automáticas de segurança", "desc": "Instala e liga as atualizações de segurança automáticas.",
      "apt": ["unattended-upgrades"], "dnf": ["dnf-automatic"],
      "post": "if [ -d /etc/apt/apt.conf.d ]; then printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades; "
@@ -1046,7 +1047,7 @@ def firewall_cmd(port, proto, allow):
 
 def ssh_ports():
     rc, out = run(["sshd", "-T"], timeout=5, merge=False) if which("sshd") else (1, "")
-    ports = {int(p) for p in re.findall(r"^port (\d+)$", out, re.M)} if rc == 0 else set()
+    ports = {int(p) for p in re.findall(r"^port (\d+)$", out, re.M | re.I)} if rc == 0 else set()
     return ports or {22}
 
 
@@ -1086,6 +1087,7 @@ def sshd_effective():
     eff = {}
     for l in out.splitlines() if rc == 0 else []:
         k, _, v = l.partition(" ")
+        k = k.lower()  # OpenSSH 10 imprime as chaves com maiúsculas
         eff[k] = (eff[k] + " " + v) if k in eff else v
     return eff
 

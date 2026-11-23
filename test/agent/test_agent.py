@@ -239,3 +239,11 @@ class CorrecoesDoDiagnostico(unittest.TestCase):
     def test_admin_fora_do_allowusers_nao_conta(self):
         self.assertFalse(agent.ssh_user_allowed({"allowusers": "deploy"}, "root"))
         self.assertTrue(agent.ssh_user_allowed({"allowusers": "root@10.0.0.*"}, "root"))
+
+    def test_le_sshd_t_com_chaves_maiusculas_do_openssh_10(self):
+        out = "Port 2222\nPermitRootLogin yes\nPasswordAuthentication yes\nAllowUsers ana\nAllowUsers root\n"
+        with mock.patch.object(agent, "which", return_value="/usr/sbin/sshd"), mock.patch.object(agent, "run", return_value=(0, out)):
+            eff = agent.sshd_effective()
+            self.assertEqual(agent.ssh_ports(), {2222})
+        self.assertEqual(eff["permitrootlogin"], "yes")
+        self.assertEqual(eff["allowusers"], "ana root")
