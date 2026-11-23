@@ -117,11 +117,20 @@ function runAction(server, a, prefill, onQueued) {
   const subject = prefill[a.target_field] ? ` <span class="mono">${esc(prefill[a.target_field])}</span>` : '';
   modal(`<h2>${esc(a.label)}${subject}</h2><p>${esc(a.desc)}${a.level !== 'read' ? ' Esta ação altera o servidor.' : ''}</p>
     <form id="axf">${formFields(visible, prefill, suggestions(server))}
-    ${a.confirm ? `<label for="ac">Digite <b>${esc(server.name)}</b> para confirmar</label><input type="text" id="ac" autocomplete="off">` : ''}
+    ${a.confirm ? `<label for="ac">Digite <b>${esc(server.name)}</b> para confirmar
+      <button type="button" class="btn sm ghost copy-name" id="acc" title="Copiar o nome do servidor">Copiar</button></label>
+      <input type="text" id="ac" autocomplete="off">` : ''}
     <div class="err" id="axe"></div>
     <div class="foot"><button type="button" class="btn ghost" data-close>Cancelar</button>
     <button class="btn ${a.confirm ? 'danger' : 'primary'}">Executar em ${esc(server.name)}</button></div></form>`, (box, close) => {
     bindFields(box, visible);
+    const copyBtn = box.querySelector('#acc');
+    if (copyBtn) copyBtn.onclick = async () => {
+      const input = box.querySelector('#ac');
+      try { await navigator.clipboard.writeText(server.name); copyBtn.textContent = 'Copiado'; }
+      catch { copyBtn.textContent = 'Use Ctrl+C'; }
+      input.focus();
+    };
     const first = box.querySelector('input,textarea,select');
     if (first) first.focus();
     box.querySelector('#axf').onsubmit = e => {
