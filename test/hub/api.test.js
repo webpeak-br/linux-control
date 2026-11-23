@@ -269,3 +269,43 @@ describe('terminal', () => {
     await hub.call('DELETE', `/api/terminal/${sid}`);
   });
 });
+
+describe('vulnerabilidades (OSV falsa)', () => {
+  let hub, srv, osv;
+  const http = require('node:http');
+  before(async () => {
+    osv = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url === '/v1/querybatch') {
+          const q = JSON.parse(body).queries;
+          return res.end(JSON.stringify({ results: q.map(x => ({ vulns: x.package.name === 'openssl' ? [{ id: 'UBUNTU-CVE-2024-1' }, { id: 'UBUNTU-CVE-2024-2' }] : [] })) }));
+        }
+        const id = decodeURIComponent(req.url.split('/').pop());
+        res.end(JSON.stringify({ id, upstream: [id.replace('UBUNTU-', '')], summary: 'falha', severity: [{ type: 'Ubuntu', score: id.endsWith('1') ? 'high' : 'low' }],
+          affected: [{ package: { name: 'openssl', ecosystem: 'Ubuntu:24.04:LTS' }, ranges: [{ events: id.endsWith('1') ? [{ introduced: '0' }, { fixed: '3.0.13-9' }] : [{ introduced: '0' }] }] }] }));
+      });
+    });
+    await new Promise(r => osv.listen(0, '127.0.0.1', r));
+    hub = await startHub({ cveUrl: `http://127.0.0.1:${osv.address().port}` });
+    await setupAdmin(hub);
+    srv = await enrollServer(hub);
+    await srv.report({ agent_version: '0', metrics: metrics(), results: [], inventory: { system: { os_id: 'ubuntu', os_version_id: '24.04', os: 'Ubuntu 24.04.5 LTS' }, actions: [], actions_mode: 'all',
+      packages: { manager: 'apt', updates: [], installed: [['libssl3', '3.0.13-1', 'openssl', '3.0.13-1'], ['openssl', '3.0.13-1'], ['bash', '5.2-1']] } } });
+  });
+  after(() => { hub.stop(); osv.close(); });
+
+  test('analisa, separa com e sem correção e leva ao diagnóstico', async () => {
+    assert.equal((await hub.call('POST', `/api/servers/${srv.id}/vulns/scan`)).status, 200);
+    let r;
+    for (let i = 0; i < 50; i++) { r = (await hub.call('GET', `/api/servers/${srv.id}/vulns`)).body; if (r.result && !r.scanning) break; await new Promise(x => setTimeout(x, 100)); }
+    const items = r.result.items;
+    assert.equal(items.length, 2);
+    assert.deepEqual(items.map(i => [i.cve, i.severity, i.fixed]), [['CVE-2024-1', 'high', '3.0.13-9'], ['CVE-2024-2', 'low', null]]);
+    assert.deepEqual(items[0].binaries, ['libssl3', 'openssl']);
+    const issue = (await hub.call('GET', `/api/servers/${srv.id}`)).body.server.health.issues.find(i => i.code === 'cve_fixable');
+    assert.equal(issue.level, 'warn');
+  });
+});

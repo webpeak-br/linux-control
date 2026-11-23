@@ -147,3 +147,14 @@ test('vulnerabilidades com correção entram no diagnóstico com o código que o
   assert.equal(fix.see, 'vulns');
   assert.equal(issues.find(i => i.code === 'cve_unfixed').level, 'info');
 });
+
+test('vulnerabilidades: o cache guarda só o necessário do aviso', () => {
+  const { slim, summarize } = require('../../hub/features/vulns');
+  const big = { id: 'UBUNTU-CVE-1', upstream: ['CVE-2024-1'], details: 'x'.repeat(10000), severity: [{ type: 'Ubuntu', score: 'high' }],
+    affected: [{ package: { name: 'openssl', ecosystem: 'Ubuntu:24.04:LTS', purl: 'p' }, ranges: [{ events: [{ introduced: '0' }, { fixed: '3.0.13-0ubuntu3.5' }] }], ecosystem_specific: { binaries: new Array(500).fill({ a: 1 }) } },
+      { package: { name: 'nodejs', ecosystem: 'Ubuntu:Pro:22.04:LTS' }, ranges: [] }, { package: { name: 'x', ecosystem: 'npm' } }] };
+  const s = slim(big);
+  assert.ok(JSON.stringify(s).length < 1000);
+  assert.equal(s.affected.length, 2);
+  assert.equal(summarize(s, { name: 'openssl', version: '3.0.13-0ubuntu3.1' }, 'Ubuntu:24.04:LTS').fixed, '3.0.13-0ubuntu3.5');
+});

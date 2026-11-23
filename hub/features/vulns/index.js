@@ -7,11 +7,14 @@ const { HttpError } = require('../../core/http');
 const migrations = [{ name: 'vulns:1', sql: [
   'CREATE TABLE IF NOT EXISTS vuln_cache (id TEXT PRIMARY KEY, data TEXT, at INTEGER)',
   'CREATE TABLE IF NOT EXISTS server_vulns (server_id INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE, data TEXT, at INTEGER, packages_at INTEGER)',
-] }];
+] },
+// v0.8.0 guardava o aviso inteiro no cache (pesado); o resumo do diagnóstico passa a ter coluna própria.
+{ name: 'vulns:2', sql: ['DELETE FROM vuln_cache'] },
+{ name: 'vulns:3', tolerant: true, sql: ['ALTER TABLE server_vulns ADD COLUMN summary TEXT'] }];
 const CACHE_SECONDS = 7 * 86400;
 const BATCH = 1000;
 const MAX_VULNS = 5000;
-const PARALLEL = 8;
+const PARALLEL = 4;
 const SEVERITIES = ['critical', 'high', 'medium', 'low', 'negligible', 'unknown'];
 
 // Ecossistema OSV a partir do /etc/os-release que o agente envia.
@@ -63,6 +66,22 @@ function summarize(vuln, pkg, ecosystem) {
     published: vuln.published ? String(vuln.published).slice(0, 10) : null };
 }
 
+// Guarda do aviso só o que o painel usa: os registros da OSV listam versões de várias distribuições e podem
+// ter centenas de KB; inteiros, estouram a memória de um hub pequeno.
+const KNOWN_ECOSYSTEM = /^(Ubuntu|Debian|AlmaLinux|Rocky Linux|Alpine)/;
+function slim(v) {
+  return {
+    id: v.id, upstream: v.upstream, aliases: (v.aliases || []).filter(a => /^CVE-/.test(a)), published: v.published,
+    summary: String(v.summary || v.details || '').replace(/\s+/g, ' ').slice(0, 400),
+    severity: (v.severity || []).filter(s => /^CVSS_V3/.test(s.type) || s.type === 'Ubuntu'),
+    database_specific: v.database_specific && v.database_specific.severity ? { severity: v.database_specific.severity } : undefined,
+    affected: (v.affected || []).filter(a => a.package && KNOWN_ECOSYSTEM.test(a.package.ecosystem || '')).map(a => ({
+      package: { name: a.package.name, ecosystem: a.package.ecosystem },
+      ranges: [{ events: (a.ranges || []).flatMap(r => r.events || []).filter(e => e.fixed) }],
+    })),
+  };
+}
+
 // Pacotes a consultar: no Debian/Ubuntu, o pacote-fonte (os avisos são por fonte), com os binários instalados dele.
 function queriesFrom(installed, ecosystem) {
   const deb = /^(Ubuntu|Debian)/.test(ecosystem);
@@ -79,6 +98,9 @@ function queriesFrom(installed, ecosystem) {
 
 function create({ db, now, config, features }) {
   const scanning = new Set();
+  // Fila: uma análise por vez, para não somar a memória de vários servidores.
+  let chain = Promise.resolve();
+  const enqueue = id => { if (scanning.has(id)) return chain; scanning.add(id); chain = chain.then(() => scanOne(id)).catch(e => console.error(`vulnerabilidades do servidor ${id}: ${e.message}`)).finally(() => scanning.delete(id)); return chain; };
 
   async function osv(path, body) {
     const res = await fetch(config.cveUrl + path, {
@@ -101,7 +123,7 @@ function create({ db, now, config, features }) {
       while (i < missing.length) {
         const id = missing[i++];
         try {
-          const v = await osv(`/v1/vulns/${encodeURIComponent(id)}`);
+          const v = slim(await osv(`/v1/vulns/${encodeURIComponent(id)}`));
           db.prepare('INSERT OR REPLACE INTO vuln_cache(id,data,at) VALUES(?,?,?)').run(id, JSON.stringify(v), now());
           out.set(id, v);
         } catch { /* um aviso que falhou não derruba a análise; entra na próxima */ }
@@ -111,17 +133,14 @@ function create({ db, now, config, features }) {
     return out;
   }
 
-  async function scan(serverId) {
-    if (scanning.has(serverId)) return;
-    scanning.add(serverId);
-    try {
+  async function scanOne(serverId) {
+    {
       const srv = features.servers.get(serverId);
       const eco = ecosystemOf((srv.inventory || {}).system);
       const installed = (srv.packages || {}).installed || [];
       if (!eco || !installed.length) {
         const reason = !eco ? 'Sistema sem base de vulnerabilidades suportada (Ubuntu, Debian, AlmaLinux, Rocky, Alpine).' : 'Lista de pacotes ainda não recebida do agente.';
-        db.prepare('INSERT OR REPLACE INTO server_vulns(server_id,data,at,packages_at) VALUES(?,?,?,?)')
-          .run(serverId, JSON.stringify({ error: reason, items: [] }), now(), srv.packages_at || 0);
+        save(serverId, { error: reason, items: [] }, srv.packages_at);
         return;
       }
       const pkgs = queriesFrom(installed, eco);
@@ -142,9 +161,18 @@ function create({ db, now, config, features }) {
       }
       const order = Object.fromEntries(SEVERITIES.map((s, i) => [s, i]));
       items.sort((a, b) => (b.fixed ? 1 : 0) - (a.fixed ? 1 : 0) || order[a.severity] - order[b.severity] || (b.score || 0) - (a.score || 0));
-      db.prepare('INSERT OR REPLACE INTO server_vulns(server_id,data,at,packages_at) VALUES(?,?,?,?)')
-        .run(serverId, JSON.stringify({ ecosystem: eco, packages: pkgs.length, items, truncated: hits.size > MAX_VULNS }), now(), srv.packages_at || 0);
-    } finally { scanning.delete(serverId); }
+      save(serverId, { ecosystem: eco, packages: pkgs.length, items, truncated: hits.size > MAX_VULNS }, srv.packages_at);
+    }
+  }
+
+  function summarize_(items, error) {
+    const count = (fix, sev) => items.filter(i => !!i.fixed === fix && (!sev || sev.includes(i.severity))).length;
+    return { error: error || null, fixable: count(true), fixable_high: count(true, ['critical', 'high']), fixable_critical: count(true, ['critical']),
+      unfixed: count(false), unfixed_high: count(false, ['critical', 'high']) };
+  }
+  function save(serverId, data, packagesAt) {
+    db.prepare('INSERT OR REPLACE INTO server_vulns(server_id,data,at,packages_at,summary) VALUES(?,?,?,?,?)')
+      .run(serverId, JSON.stringify(data), now(), packagesAt || 0, JSON.stringify(summarize_(data.items || [], data.error)));
   }
 
   function stored(serverId) {
@@ -155,12 +183,8 @@ function create({ db, now, config, features }) {
   return {
     // Resumo que o diagnóstico usa (contagens por gravidade, com e sem correção).
     summary(serverId) {
-      const r = db.prepare('SELECT data, at FROM server_vulns WHERE server_id=?').get(serverId);
-      if (!r) return null;
-      const d = JSON.parse(r.data);
-      const count = (fix, sev) => (d.items || []).filter(i => !!i.fixed === fix && (!sev || sev.includes(i.severity))).length;
-      return { at: r.at, error: d.error || null, fixable: count(true), fixable_high: count(true, ['critical', 'high']), fixable_critical: count(true, ['critical']),
-        unfixed: count(false), unfixed_high: count(false, ['critical', 'high']) };
+      const r = db.prepare('SELECT summary, at FROM server_vulns WHERE server_id=?').get(serverId);
+      return r && r.summary ? { at: r.at, ...JSON.parse(r.summary) } : null;
     },
     routes(router) {
       router.add('GET /api/servers/:id/vulns', ({ params }) => {
@@ -172,7 +196,7 @@ function create({ db, now, config, features }) {
         const id = Number(params.id);
         features.servers.get(id);
         if (!config.cveUrl) throw new HttpError(400, 'A consulta de vulnerabilidades está desligada (LCTL_CVE=0).');
-        scan(id).catch(e => console.error(`vulnerabilidades do servidor ${id}: ${e.message}`));
+        enqueue(id);
         return { ok: true };
       });
     },
@@ -181,7 +205,7 @@ function create({ db, now, config, features }) {
       // Reanalisa quando o agente manda uma lista de pacotes nova (a cada 6 h ou depois de atualizar) ou a cada 24 h.
       for (const s of db.prepare('SELECT s.id, s.packages_at, v.packages_at AS done_at, v.at FROM servers s LEFT JOIN server_vulns v ON v.server_id = s.id WHERE s.packages_at IS NOT NULL').all()) {
         if (s.done_at !== s.packages_at || now() - (s.at || 0) > 86400) {
-          try { await scan(s.id); } catch (e) { console.error(`vulnerabilidades do servidor ${s.id}: ${e.message}`); }
+          await enqueue(s.id);
         }
       }
       db.prepare('DELETE FROM vuln_cache WHERE at < ?').run(now() - 4 * CACHE_SECONDS);
@@ -189,4 +213,4 @@ function create({ db, now, config, features }) {
   };
 }
 
-module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom };
+module.exports = { migrations, create, ecosystemOf, cvss3Score, summarize, queriesFrom, slim };
