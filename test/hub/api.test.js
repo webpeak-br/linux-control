@@ -184,3 +184,24 @@ describe('biblioteca de chaves SSH', () => {
     assert.equal((await hub.call('GET', '/api/ssh-keys')).status, 401);
   });
 });
+
+describe('catálogo com ações de estado', () => {
+  let hub, srv;
+  before(async () => { hub = await startHub(); await setupAdmin(hub); srv = await enrollServer(hub); });
+  after(() => hub.stop());
+
+  test('"done" vira booleano estrito e ação repetível fica sem estado', async () => {
+    const actions = [
+      { id: 'fix.firewall', group: 'S', label: 'F', level: 'danger', done: 'yes', done_label: 'ativo' },
+      { id: 'fix.fail2ban', group: 'S', label: 'B', level: 'change', done: true, done_label: 'x'.repeat(500) },
+      { id: 'cleanup.tmp', group: 'L', label: 'T', level: 'change' },
+    ];
+    await srv.report({ agent_version: '0', metrics: metrics(), results: [], inventory: { actions } });
+    const cat = (await hub.call('GET', `/api/servers/${srv.id}`)).body.server.inventory.actions;
+    const by = Object.fromEntries(cat.map(a => [a.id, a]));
+    assert.equal(by['fix.firewall'].done, false);
+    assert.equal(by['fix.fail2ban'].done, true);
+    assert.equal(by['fix.fail2ban'].done_label.length, 120);
+    assert.equal('done' in by['cleanup.tmp'], false);
+  });
+});

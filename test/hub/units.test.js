@@ -118,3 +118,4 @@ test('tentativas de SSH com Fail2ban ativo viram informação, sem botão de ins
   assert.equal(p.level, 'info');
   assert.match(p.text, /3 IP\(s\) bloqueado/);
 });
+

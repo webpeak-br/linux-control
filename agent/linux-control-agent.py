@@ -808,12 +808,20 @@ def security():
     if which("needs-restarting"):
         rc, _ = run(["needs-restarting", "-r"], timeout=20)
         sec["reboot_required"] = sec["reboot_required"] or rc == 1
+    auto = auto_updates_enabled()
+    if auto is not None:
+        sec["auto_updates"] = auto
+    return sec
+
+
+def auto_updates_enabled():
+    """True/False quando dá para saber (apt ou dnf); None em outros sistemas."""
     auto = read("/etc/apt/apt.conf.d/20auto-upgrades")
     if auto:
-        sec["auto_updates"] = bool(re.search(r'Unattended-Upgrade\s+"1"', auto))
-    elif os.path.exists("/etc/dnf/automatic.conf"):
-        sec["auto_updates"] = run(["systemctl", "is-enabled", "dnf-automatic.timer"], merge=False)[1].strip() == "enabled"
-    return sec
+        return bool(re.search(r'Unattended-Upgrade\s+"1"', auto))
+    if os.path.exists("/etc/dnf/automatic.conf"):
+        return run(["systemctl", "is-enabled", "dnf-automatic.timer"], merge=False)[1].strip() == "enabled"
+    return None
 
 
 # ---------------------------------------------------------------- ações
@@ -828,6 +836,8 @@ def security():
 #           (tipos: text, textarea, select, bool, cron; "suggest" pede sugestões do inventário)
 #   fixes   códigos de problema do diagnóstico que a ação resolve (botão "Resolver" na Visão geral)
 #   available  função opcional: quando devolve False, a ação sai do catálogo publicado
+#   done    função opcional das ações de ESTADO: True = já aplicada (o painel mostra "já aplicado" em vez de Executar).
+#           Ações sem "done" são repetíveis: limpeza, atualizações e leituras podem rodar quantas vezes for preciso.
 #   sh | run   comando fixo de shell, ou função Python que recebe os parâmetros já validados
 
 LEVELS_BY_MODE = {
@@ -1642,25 +1652,31 @@ ACTIONS = [
      "desc": "Remove a liberação de uma porta no UFW ou firewalld.", "run": run_firewall(False),
      "fields": [f_text("port", "Porta", r"^[0-9]{1,5}$"), f_select("proto", "Protocolo", ["tcp", "udp"])]},
     {"id": "fix.ssh_root_password", "group": "Segurança", "label": "Bloquear senha do root no SSH", "level": "danger", "confirm": True,
-     "fixes": ["ssh_root_password"], "run": run_ssh_root_password,
+     "fixes": ["ssh_root_password"], "run": run_ssh_root_password, "done_label": "o root já não entra com senha",
+     "done": lambda: sshd_effective().get("permitrootlogin") in ("no", "prohibit-password", "without-password", "forced-commands-only"),
      "desc": "Root passa a entrar só por chave SSH (PermitRootLogin prohibit-password). Antes de confirmar, garanta que você tem a chave privada do root ou a senha de outro administrador."},
     {"id": "fix.ssh_password_off", "group": "Segurança", "label": "Desligar login por senha no SSH", "level": "danger", "confirm": True,
-     "fixes": ["ssh_password_auth"], "run": run_ssh_password_off,
+     "fixes": ["ssh_password_auth"], "run": run_ssh_password_off, "done_label": "o SSH já não aceita senha",
+     "done": lambda: sshd_effective().get("passwordauthentication") == "no",
      "desc": "Todos passam a entrar só por chave SSH. Antes de confirmar, garanta que você tem a chave privada de um administrador: quem só usa senha perde o acesso."},
     {"id": "fix.fail2ban", "group": "Segurança", "label": "Bloquear ataques ao SSH (Fail2ban)", "level": "change", "timeout": 900,
-     "fixes": ["ssh_bruteforce"], "run": run_fail2ban,
+     "fixes": ["ssh_bruteforce"], "run": run_fail2ban, "done_label": "Fail2ban protegendo o SSH",
+     "done": lambda: which("fail2ban-client") is not None and fail2ban_sshd() is not None,
      "desc": "Instala e liga o Fail2ban: IP que errar a senha 5 vezes em 10 minutos fica bloqueado por 1 hora."},
     {"id": "fix.firewall", "group": "Segurança", "label": "Ativar firewall", "level": "danger", "confirm": True, "timeout": 900,
-     "fixes": ["firewall_off"], "run": run_enable_firewall,
+     "fixes": ["firewall_off"], "run": run_enable_firewall, "done_label": "firewall já ativo",
+     "done": lambda: firewall_status()["active"],
      "desc": "Liga o UFW (ou firewalld) mantendo abertas o SSH e todas as portas que já recebem conexões hoje. Com Docker, o serviço é reiniciado."},
     {"id": "fix.auto_updates", "group": "Segurança", "label": "Ligar atualizações automáticas", "level": "change", "timeout": 900,
-     "fixes": ["auto_updates_off"], "run": run_install_app("autoupdates"),
+     "fixes": ["auto_updates_off"], "run": run_install_app("autoupdates"), "done_label": "atualizações automáticas já ligadas",
+     "done": lambda: auto_updates_enabled() is True,
      "desc": "Instala e liga a instalação automática das atualizações de segurança."},
     {"id": "fix.restart_failed", "group": "Serviços", "label": "Reiniciar serviços com falha", "level": "change", "timeout": 600,
      "fixes": ["services_failed"], "run": run_restart_failed,
      "desc": "Tenta reiniciar cada serviço em falha e mostra quais voltaram."},
     {"id": "fix.ntp", "group": "Sistema", "label": "Sincronizar relógio", "level": "change", "timeout": 120,
-     "fixes": ["ntp_off"], "sh": NTP_SH,
+     "fixes": ["ntp_off"], "sh": NTP_SH, "done_label": "relógio já sincronizado",
+     "done": lambda: run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], timeout=10, merge=False)[1].strip() == "yes",
      "desc": "Liga a sincronização automática de hora (NTP)."},
     {"id": "fix.renew_certs", "group": "Segurança", "label": "Renovar certificados (Certbot)", "level": "change", "timeout": 900,
      "fixes": ["cert_expiring"],
@@ -1767,9 +1783,22 @@ def allowed_actions(mode):
     return [a for a in ACTIONS if a["level"] in levels]
 
 
+def action_state(a):
+    """Ações de estado (ligar Fail2ban, firewall…) informam se já estão aplicadas; as repetíveis (limpeza,
+    atualizações, leituras) não têm "done" e sempre podem rodar de novo."""
+    if "done" not in a:
+        return {}
+    try:
+        done = bool(a["done"]())
+    except Exception:
+        done = False
+    return {"done": done, "done_label": a.get("done_label", "já aplicado")}
+
+
 def action_catalog(mode):
     """Catálogo publicado: ações com "available" só aparecem quando fazem sentido (ex.: instalar o que falta)."""
-    return [{k: a[k] for k in PUBLIC_KEYS if k in a} for a in allowed_actions(mode) if a.get("available", lambda: True)()]
+    return [dict({k: a[k] for k in PUBLIC_KEYS if k in a}, **action_state(a))
+            for a in allowed_actions(mode) if a.get("available", lambda: True)()]
 
 
 def validate_params(action, raw):

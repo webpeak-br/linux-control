@@ -34,16 +34,24 @@ export function placementButtons(server, place) {
 // As que mudam o servidor vêm primeiro (resolvem); as de leitura depois (ajudam a investigar).
 export function fixButtons(server, issue) {
   const order = a => (a.level === 'read' ? 1 : 0);
-  return catalog(server).filter(a => (a.fixes || []).includes(issue.code))
+  return catalog(server).filter(a => (a.fixes || []).includes(issue.code) && !a.done)
     .sort((x, y) => order(x) - order(y))
     .map(a => `<button class="btn sm ${a.level === 'read' ? 'ghost' : isDangerous(a) ? 'danger' : 'primary'}" data-run="${esc(a.id)}"
       title="${esc(a.desc)}">${a.level === 'read' ? '' : 'Resolver: '}${esc(a.label)}</button>`).join('');
 }
 
-export function actionRow(a) {
-  return `<div class="act"><div><div class="t">${esc(a.label)} ${LEVEL_PILL[a.level] || ''}</div><div class="d">${esc(a.desc)}</div></div>
-    <button class="btn sm ${btnClass(a)}" data-run="${esc(a.id)}">Executar</button></div>`;
+// Ação de estado já aplicada mostra o estado no lugar do botão (as de risco somem; as demais podem ser reaplicadas).
+// "last" é a execução mais recente dessa ação, para lembrar quando ela rodou.
+export function actionRow(a, last) {
+  const ran = last ? `<div class="d dim">última vez: ${esc(new Date(last.created * 1000).toLocaleString('pt-BR'))} · ${esc(LAST_STATUS[last.status] || last.status)}</div>` : '';
+  const done = a.done ? `<span class="pill ok">✓ ${esc(a.done_label)}</span>` : '';
+  const btn = a.done
+    ? (isDangerous(a) ? '' : `<button class="btn sm ghost" data-run="${esc(a.id)}" title="Já aplicado; rodar de novo não faz mal">Reaplicar</button>`)
+    : `<button class="btn sm ${btnClass(a)}" data-run="${esc(a.id)}">Executar</button>`;
+  return `<div class="act${a.done ? ' done' : ''}"><div><div class="t">${esc(a.label)} ${a.done ? '' : LEVEL_PILL[a.level] || ''}</div><div class="d">${esc(a.desc)}</div>${ran}</div>
+    <div class="act-side">${done}${btn}</div></div>`;
 }
+const LAST_STATUS = { done: 'concluída', failed: 'falhou', queued: 'na fila', sent: 'executando', lost: 'sem resposta', expired: 'expirou', canceled: 'cancelada' };
 
 export function bindRunButtons(root, server, onQueued) {
   root.querySelectorAll('[data-run]').forEach(b => {

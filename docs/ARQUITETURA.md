@@ -105,6 +105,12 @@ Cada problema do diagnóstico (`hub/features/servers/health.js`) tem um `code` e
 - **Datacenter** (`cloud`): o agente reconhece o provedor pelo DMI e só então consulta a região no serviço de metadados do próprio provedor. **Localização do IP** (`geo`): o hub consulta o IP público no ipinfo.io e guarda por 7 dias (`LCTL_GEOIP=0` desliga).
 - **Chaves SSH**: a biblioteca (`features/keys`) guarda só chaves públicas e recusa chave privada. Elas são instaladas pela ação `ssh.authorize_key`, que aceita root ou contas de pessoa. É o único id de ação citado na interface (`AUTHORIZE_KEY_ACTION`), porque a instalação em vários servidores não parte do catálogo de um servidor só.
 
+## Ações repetíveis e ações de estado
+
+- **Repetíveis** (limpeza, atualizações, leituras, testes de disco, reiniciar serviços com falha): podem rodar quantas vezes for preciso e sempre mostram Executar.
+- **De estado** (Fail2ban, firewall, senha do root e login por senha no SSH, atualizações automáticas, relógio): declaram `done` no agente, uma conferência do estado real feita a cada inventário. Já aplicadas, mostram "✓ já aplicado"; as de risco ficam sem botão e as demais oferecem Reaplicar. O botão Resolver do diagnóstico nunca oferece uma ação já aplicada.
+- A aba Ações mostra quando cada ação rodou pela última vez e com que resultado.
+
 ## Protocolo agente ↔ hub
 
 - `POST /api/agent/report` com `Authorization: Bearer <token>` e corpo `{ agent_version, interval, metrics, results: [{id, exit_code, output, duration}], inventory? }`. O inventário traz `actions` (catálogo) e, a cada 6 h, `packages`.

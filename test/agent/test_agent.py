@@ -333,3 +333,23 @@ class Fail2ban(unittest.TestCase):
     def test_jail_desligado_devolve_none(self):
         with mock.patch.object(agent, "run", return_value=(255, "Sorry but the jail 'sshd' does not exist")):
             self.assertIsNone(agent.fail2ban_sshd())
+
+
+class AcoesDeEstado(unittest.TestCase):
+    def test_repetiveis_nao_tem_estado_e_de_estado_informam_se_ja_aplicadas(self):
+        with mock.patch.object(agent, "firewall_status", return_value={"active": True}), \
+             mock.patch.object(agent, "sshd_effective", return_value={"permitrootlogin": "yes", "passwordauthentication": "yes"}), \
+             mock.patch.object(agent, "which", return_value=None), mock.patch.object(agent, "run", return_value=(0, "no")), \
+             mock.patch.object(agent, "auto_updates_enabled", return_value=True):
+            cat = {a["id"]: a for a in agent.action_catalog("all")}
+        self.assertNotIn("done", cat["cleanup.tmp"])
+        self.assertNotIn("done", cat["security.apply_all"])
+        self.assertTrue(cat["fix.firewall"]["done"])
+        self.assertFalse(cat["fix.ssh_root_password"]["done"])
+        self.assertFalse(cat["fix.fail2ban"]["done"])
+        self.assertTrue(cat["fix.auto_updates"]["done"])
+        self.assertFalse(cat["fix.ntp"]["done"])
+
+    def test_falha_ao_conferir_estado_nao_derruba_o_catalogo(self):
+        a = {"id": "x.y", "done": lambda: 1 / 0}
+        self.assertEqual(agent.action_state(a), {"done": False, "done_label": "já aplicado"})

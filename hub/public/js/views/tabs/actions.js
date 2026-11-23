@@ -23,7 +23,7 @@ export function body(s) {
   // Ações com alvo ou com lugar próprio aparecem nas outras abas; aqui ficam as gerais.
   const groups = {};
   catalog(s).filter(a => !a.target && !a.placement).forEach(a => { (groups[a.group] = groups[a.group] || []).push(a); });
-  const g = Object.entries(groups).map(([name, list]) => `<div class="panel"><h3>${esc(name)}</h3>${list.map(actionRow).join('')}</div>`).join('');
+  const g = Object.entries(groups).map(([name, list]) => `<div class="panel"><h3>${esc(name)}</h3>${list.map(a => actionRow(a, commands.find(c => c.action === a.id))).join('')}</div>`).join('');
   const cmds = commands.map(c => {
     const [cls, txt] = STATUS[c.status] || ['', c.status];
     return `<div class="cmd-item"><div class="cmd-row" data-cmd="${N(c.id)}"><span class="pill ${cls}">${txt}${c.status === 'failed' ? ` (${N(c.exit_code)})` : ''}</span>

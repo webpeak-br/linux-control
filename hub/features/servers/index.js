@@ -40,7 +40,12 @@ function cleanCatalog(actions) {
   return (Array.isArray(actions) ? actions : []).filter(a => a && ACTION_ID.test(a.id) && LEVELS.has(a.level)
     && (!a.target || TARGETS.has(a.target))
     && (a.fields || []).every(f => f && FIELD_NAME.test(f.name) && FIELD_TYPES.has(f.type)))
-    .map(a => (a.fixes === undefined ? a : { ...a, fixes: (Array.isArray(a.fixes) ? a.fixes : []).filter(c => typeof c === 'string' && ISSUE_CODE.test(c)) }));
+    .map(a => {
+      const out = { ...a };
+      if (a.fixes !== undefined) out.fixes = (Array.isArray(a.fixes) ? a.fixes : []).filter(c => typeof c === 'string' && ISSUE_CODE.test(c));
+      if (a.done !== undefined) { out.done = a.done === true; out.done_label = String(a.done_label || 'já aplicado').slice(0, 120); }
+      return out;
+    });
 }
 
 function fromRow(row) {
