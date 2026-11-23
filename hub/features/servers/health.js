@@ -12,6 +12,7 @@ const LIMITS = {
   swap: { warn: 80 },
   cpu: { warn: 90 },
   loadPerCore: { warn: 1.2, crit: 2 },
+  diskWear: { warn: 90 },
 };
 const CERT_WARN_DAYS = 14;
 const LABELS = { ok: 'Saudável', warn: 'Atenção', crit: 'Crítico', offline: 'Offline', pending: 'Aguardando' };
@@ -59,6 +60,22 @@ function evaluate(srv, now = Date.now() / 1000) {
   const units = (inv.services && inv.services.units) || [];
   const failed = units.filter(u => u.active === 'failed');
   if (failed.length) add('warn', 'serviços', `${failed.length} serviço(s) com falha: ${failed.slice(0, 5).map(u => u.name.replace(/\.service$/, '')).join(', ')}${failed.length > 5 ? '…' : ''}.`, 'services_failed', 'services');
+
+  // Saúde física dos discos (SMART) e erros de leitura e gravação no log do kernel.
+  const dh = inv.disk_health || {};
+  for (const d of dh.devices || []) {
+    const who = `Disco ${d.name}${d.model ? ` (${d.model})` : ''}`;
+    const bad = (d.pending || 0) + (d.offline_uncorrectable || 0) + (d.reported_uncorrect || 0);
+    if (d.smart_passed === false) add('crit', 'discos', `${who} reprovado no SMART: falha iminente. Faça backup e troque o disco.`, 'disk_smart', 'disks');
+    if (bad > 0) add('crit', 'discos', `${who} com ${bad} setor(es) que não conseguem ser lidos. Faça backup e planeje a troca.`, 'disk_sectors', 'disks');
+    if (d.reallocated > 0) add('warn', 'discos', `${who} já substituiu ${d.reallocated} setor(es) defeituoso(s).`, 'disk_sectors', 'disks');
+    if (d.media_errors > 0) add('crit', 'discos', `${who} com ${d.media_errors} erro(s) de mídia (NVMe).`, 'disk_sectors', 'disks');
+    if (d.critical_warning) add('crit', 'discos', `${who} emitiu alerta crítico (NVMe).`, 'disk_smart', 'disks');
+    if (d.wear_pct >= LIMITS.diskWear.warn) add('warn', 'discos', `${who} com ${d.wear_pct}% da vida útil consumida.`, 'disk_wear', 'disks');
+    if (d.last_test && d.last_test.passed === false) add('crit', 'discos', `${who} falhou no último autoteste: ${d.last_test.status}.`, 'disk_smart', 'disks');
+  }
+  if (dh.io_errors_24h > 0) add('crit', 'discos', `${dh.io_errors_24h} erro(s) de leitura/gravação de disco no log do kernel (24h).`, 'disk_io_errors', 'disks');
+  if (dh.smartctl === false && dh.virtual === false) add('info', 'discos', 'Instale o monitor de disco para acompanhar setores defeituosos e desgaste.', 'smart_missing', 'disks');
 
   const sec = inv.security || {};
   if (sec.reboot_required) add('warn', 'sistema', 'Reinício pendente para concluir atualizações.', 'reboot_required');

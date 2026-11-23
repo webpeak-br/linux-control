@@ -10,6 +10,7 @@ const EVENTS = {
   registro: 'Registro da instalação', acao: 'Ação', servidor_criado: 'Servidor criado', servidor_removido: 'Servidor removido',
   token_regenerado: 'Token regenerado', alertas_configurados: 'Alertas configurados',
   atualizacao_hub: 'Atualização do painel', atualizacao_agente: 'Atualização de agente',
+  chave_ssh_cadastrada: 'Chave SSH cadastrada', chave_ssh_removida: 'Chave SSH removida',
 };
 
 function create({ db, now }) {

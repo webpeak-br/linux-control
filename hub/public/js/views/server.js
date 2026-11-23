@@ -13,6 +13,7 @@ import { esc, ago, dur, ipsOf, STATUS_PILL, datacenter, ipPlace, flag } from '..
 import { bindRunButtons, loadAgentCommands } from '../actions.js';
 import { bindCopy } from '../ui.js';
 import * as overview from './tabs/overview.js';
+import * as disks from './tabs/disks.js';
 import * as processes from './tabs/processes.js';
 import * as services from './tabs/services.js';
 import * as network from './tabs/network.js';
@@ -24,7 +25,7 @@ import * as schedules from './tabs/schedules.js';
 import * as actions from './tabs/actions.js';
 import * as settings from './tabs/settings.js';
 
-const TABS = { overview, processes, services, network, docker, software, security, users, schedules, actions, settings };
+const TABS = { overview, disks, processes, services, network, docker, software, security, users, schedules, actions, settings };
 const REFRESH_MS = 10_000;
 
 export function serverView(root, id, tabName, arg) {

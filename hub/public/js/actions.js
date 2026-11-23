@@ -6,6 +6,9 @@ import { modal, toast, formFields, bindFields, readForm } from './ui.js';
 
 const LEVEL_PILL = { change: '<span class="pill">altera o servidor</span>', danger: '<span class="pill crit">cuidado</span>', admin: '<span class="pill brand">admin</span>' };
 
+// Única exceção à regra de não citar ids: a biblioteca de chaves (Configurações) instala em vários servidores de uma vez.
+export const AUTHORIZE_KEY_ACTION = 'ssh.authorize_key';
+
 export const catalog = server => (server.inventory || {}).actions || [];
 export const mode = server => (server.inventory || {}).actions_mode || 'readonly';
 const isDangerous = a => !!a.confirm || a.level === 'danger';
@@ -66,6 +69,7 @@ function suggestions(server) {
     services: ((inv.services || {}).units || []).map(u => u.key),
     containers: (((inv.docker || {}).containers) || []).map(c => c.key),
     users: ((inv.users || {}).accounts || []).map(u => u.key),
+    ssh_keys: (keyLibrary || []).map(k => ({ label: k.name, value: k.key })),
   };
 }
 
@@ -98,9 +102,10 @@ function runAction(server, a, prefill, onQueued) {
   });
 }
 
-let agentCommands = null;
+let agentCommands = null, keyLibrary = null;
 export async function loadAgentCommands() {
   if (!agentCommands) agentCommands = await api('/api/agent/commands');
+  keyLibrary = (await api('/api/ssh-keys').catch(() => ({ keys: [] }))).keys;  // chaves salvas viram opção nos formulários
   return agentCommands;
 }
 

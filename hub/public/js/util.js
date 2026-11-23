@@ -40,7 +40,8 @@ export const countryName = c => { try { return (c && COUNTRY && COUNTRY.of(c)) |
 export function datacenter(s) {
   const c = s.cloud || (s.inventory || {}).cloud;
   if (!c || !c.provider) return '';
-  const where = [c.region, c.city && c.city !== c.region ? c.city : ''].filter(Boolean).join(' · ');
+  const sameCity = s.geo && s.geo.city === c.city;  // a cidade já aparece na localização do IP
+  const where = [c.region, c.city && c.city !== c.region && !sameCity ? c.city : ''].filter(Boolean).join(' · ');
   return where ? `${c.provider} · ${where}` : c.provider;
 }
 export function ipPlace(s) {

@@ -89,3 +89,21 @@ test('localização: só IP público é consultado e a resposta é normalizada',
   const g = clean({ city: 'Los Angeles', region: 'California', country: 'us', loc: '34.05,-118.24', org: 'AS20473 The Constant Company, LLC' });
   assert.deepEqual([g.country, g.asn, g.org, g.lat], ['US', 'AS20473', 'The Constant Company, LLC', 34.05]);
 });
+
+test('discos: setor ilegível é crítico, remapeado é atenção, erro no kernel é crítico', () => {
+  const inv = dh => ({ disk_health: dh });
+  const codes = dh => evaluate({ last_seen: now, metrics: {}, inventory: inv(dh) }, now).issues.map(i => `${i.level}:${i.code}`);
+  assert.deepEqual(codes({ devices: [{ name: '/dev/sda', smart_passed: true, pending: 3, reallocated: 8 }] }), ['crit:disk_sectors', 'warn:disk_sectors']);
+  assert.deepEqual(codes({ devices: [], io_errors_24h: 4 }), ['crit:disk_io_errors']);
+  assert.deepEqual(codes({ devices: [], smartctl: false, virtual: false }), ['info:smart_missing']);
+  assert.deepEqual(codes({ devices: [], smartctl: false, virtual: true }), []);
+});
+
+test('chaves SSH: só pública, privada é recusada com aviso', () => {
+  const { parseKey, fingerprint } = require('../../hub/features/keys');
+  const pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0n7Xb9mWkq1f3mJ8l0j0tq3k2m0c8m7d1x2y3z4w5 ana@note';
+  assert.equal(parseKey(`  ${pub}\n`), pub);
+  assert.match(fingerprint(pub), /^SHA256:/);
+  assert.throws(() => parseKey('-----BEGIN OPENSSH PRIVATE KEY-----\nabc'), /PRIVADA/);
+  assert.throws(() => parseKey('ssh-ed25519 curta'), /inválida/);
+});

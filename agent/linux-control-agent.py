@@ -425,6 +425,70 @@ def cloud_info():
     return res
 
 
+# ---------------------------------------------------------------- saúde dos discos
+#
+# Duas fontes: o SMART de cada disco físico (smartctl, do pacote smartmontools) e os erros de leitura e gravação
+# que o kernel registra. A segunda funciona também em máquina virtual, onde o SMART não existe.
+
+ATA_ATTRS = {5: "reallocated", 187: "reported_uncorrect", 196: "realloc_events", 197: "pending", 198: "offline_uncorrectable", 199: "crc_errors"}
+IO_ERROR_RE = re.compile(r"I/O error|Medium Error|Unrecovered read error|\bUNC\b|critical medium error|Buffer I/O error|"
+                         r"EXT4-fs error|XFS \(.*\): (?:Corruption|metadata I/O error)|BTRFS (?:error|critical)|"
+                         r"ata\d+(?:\.\d+)?: (?:failed command|exception Emask)|nvme\d+n?\d*: .*(?:I/O .*timeout|controller is down)", re.I)
+IO_IGNORE_RE = re.compile(r"\b(loop\d+|sr\d+|fd\d+)\b")
+
+
+def smart_device(name, dtype):
+    cmd = ["smartctl", "-j", "-a", name] + (["-d", dtype] if dtype else [])
+    rc, out = run(cmd, timeout=30, merge=False)  # o código de saída do smartctl é um mapa de bits: o JSON vale mesmo assim
+    try:
+        j = json.loads(out)
+    except ValueError:
+        return None
+    d = {"name": name, "model": j.get("model_name") or j.get("model_family") or "",
+         "capacity": (j.get("user_capacity") or {}).get("bytes"), "rotational": (j.get("rotation_rate") or 0) > 0,
+         "protocol": (j.get("device") or {}).get("protocol", ""),
+         "smart_passed": (j.get("smart_status") or {}).get("passed"),
+         "temperature": (j.get("temperature") or {}).get("current"),
+         "power_on_hours": (j.get("power_on_time") or {}).get("hours")}
+    for a in (j.get("ata_smart_attributes") or {}).get("table", []):
+        if a.get("id") in ATA_ATTRS:
+            d[ATA_ATTRS[a["id"]]] = (a.get("raw") or {}).get("value")
+    nv = j.get("nvme_smart_health_information_log")
+    if nv:
+        d.update({"media_errors": nv.get("media_errors"), "critical_warning": nv.get("critical_warning"),
+                  "wear_pct": nv.get("percentage_used"), "spare_pct": nv.get("available_spare")})
+    st = (j.get("ata_smart_self_test_log") or {}).get("standard", {}).get("table") or []
+    if st:
+        d["last_test"] = {"type": (st[0].get("type") or {}).get("string", ""), "status": (st[0].get("status") or {}).get("string", ""),
+                          "passed": (st[0].get("status") or {}).get("passed"), "hours": st[0].get("lifetime_hours")}
+    return d
+
+
+def kernel_io_errors(hours=24):
+    if which("journalctl"):
+        rc, out = run(["journalctl", "-k", "--since=-%dh" % hours, "--no-pager", "-o", "short-iso", "-q"], timeout=30, merge=False)
+    else:
+        rc, out = run(["dmesg", "-T"], timeout=15, merge=False)
+    lines = [l.strip() for l in out.splitlines() if IO_ERROR_RE.search(l) and not IO_IGNORE_RE.search(l)]
+    return len(lines), [mask_secrets(l)[:300] for l in lines[-20:]]
+
+
+def disk_health():
+    res = {"smartctl": bool(which("smartctl")), "virtual": run(["systemd-detect-virt", "-q"], merge=False)[0] == 0, "devices": []}
+    if res["smartctl"]:
+        rc, out = run(["smartctl", "--scan-open", "-j"], timeout=30, merge=False)
+        try:
+            devs = json.loads(out).get("devices", [])
+        except ValueError:
+            devs = []
+        for dev in devs[:16]:
+            d = smart_device(dev.get("name"), dev.get("type"))
+            if d:
+                res["devices"].append(d)
+    res["io_errors_24h"], res["io_error_lines"] = kernel_io_errors(24)
+    return res
+
+
 def services():
     if not which("systemctl"):
         return {"available": False, "units": []}
@@ -1413,6 +1477,65 @@ def run_restart_failed(p, state):
     return (1 if still else 0), "\n".join(lines) + ("\n\nVeja os logs dos que continuam falhando na aba Serviços." if still else "")
 
 
+def smart_devices():
+    rc, out = run(["smartctl", "--scan-open", "-j"], timeout=30, merge=False)
+    try:
+        return [(d["name"], d.get("type")) for d in json.loads(out).get("devices", [])]
+    except (ValueError, KeyError):
+        return []
+
+
+def run_disk_report(p, state):
+    parts = []
+    if which("smartctl"):
+        for name, dtype in smart_devices() or []:
+            rc, out = run(["smartctl", "-x", name] + (["-d", dtype] if dtype else []), timeout=60)
+            parts.append("==== %s ====\n%s" % (name, out.strip()))
+        if not parts:
+            parts.append("Nenhum disco com SMART encontrado (comum em máquina virtual: o disco físico é do provedor).")
+    else:
+        parts.append("smartmontools não instalado: sem leitura SMART. Use \"Instalar monitor de disco\".")
+    n, lines = kernel_io_errors(72)
+    parts.append("==== Erros de disco no log do kernel (72 h): %d ====\n%s" % (n, "\n".join(lines) or "nenhum"))
+    rc, out = run(["/bin/sh", "-c", "lsblk -o NAME,SIZE,TYPE,MODEL,ROTA,MOUNTPOINT 2>/dev/null"], timeout=15)
+    parts.append("==== Discos ====\n" + out.strip())
+    return 0, "\n\n".join(parts)
+
+
+def run_disk_test(kind):
+    def fn(p, state):
+        if not which("smartctl"):
+            return 1, "smartmontools não instalado. Use \"Instalar monitor de disco\" primeiro."
+        devs = smart_devices()
+        if not devs:
+            return 1, "Nenhum disco com SMART encontrado (em máquina virtual o teste é feito pelo provedor)."
+        out = []
+        for name, dtype in devs:
+            rc, o = run(["smartctl", "-t", kind, name] + (["-d", dtype] if dtype else []), timeout=30)
+            m = re.search(r"Please wait (\d+) minutes", o)
+            out.append("%s: %s" % (name, ("teste iniciado, leva cerca de %s min" % m.group(1)) if m else o.strip().splitlines()[-1] if o.strip() else "?"))
+        return 0, "\n".join(out) + "\n\nO resultado aparece na aba Discos (coluna Último teste) quando terminar. O servidor segue funcionando durante o teste."
+    return fn
+
+
+def run_smartmontools(p, state):
+    cmd = install_packages_cmd(["smartmontools"])
+    if not cmd:
+        return 1, "Gerenciador de pacotes não suportado."
+    rc, out = run(["/bin/sh", "-c", cmd + " && { systemctl enable --now smartmontools 2>/dev/null || systemctl enable --now smartd 2>/dev/null || true; smartctl --scan; }"], timeout=900)
+    return rc, out[-4000:]
+
+
+def run_authorize_key(p, state):
+    """Autoriza uma chave SSH para root ou para uma conta de pessoa (nunca contas de sistema)."""
+    pw = existing_user(p["user"])
+    if not pw:
+        return 1, "Usuário %s não existe." % p["user"]
+    if pw.pw_uid != 0 and not is_person(pw):
+        return 1, "Por segurança, só root e contas de pessoas (UID 1000 ou maior) recebem chaves pelo painel."
+    return 0, "%s: %s" % (pw.pw_name, install_ssh_key(pw, p["ssh_key"]))
+
+
 NTP_SH = ("if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?|ntpd?)\\.service'; then "
           "echo 'Nenhum serviço de hora encontrado; instalando o chrony.'; "
           "if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else dnf -y -q install chrony || yum -y -q install chrony; fi; "
@@ -1530,6 +1653,22 @@ ACTIONS = [
      "sh": "PATH=$PATH:/snap/bin; if ! command -v certbot >/dev/null; then echo 'Certbot não instalado: este certificado é renovado por outra ferramenta.'; exit 1; fi; "
            "certbot renew --no-random-sleep-on-renew 2>&1; rc=$?; "
            "systemctl reload nginx 2>/dev/null || systemctl reload apache2 2>/dev/null || systemctl reload httpd 2>/dev/null || true; exit $rc"},
+    {"id": "disk.report", "group": "Discos", "label": "Relatório de saúde dos discos", "level": "read", "timeout": 300, "placement": "disks",
+     "fixes": ["disk_smart", "disk_sectors", "disk_wear", "disk_io_errors"], "run": run_disk_report,
+     "desc": "SMART completo de cada disco e os erros de leitura e gravação registrados pelo kernel."},
+    {"id": "disk.short_test", "group": "Discos", "label": "Teste rápido do disco (2 min)", "level": "change", "placement": "disks",
+     "fixes": ["disk_sectors"], "run": run_disk_test("short"),
+     "desc": "Pede ao próprio disco um autoteste rápido. O servidor continua funcionando."},
+    {"id": "disk.long_test", "group": "Discos", "label": "Teste completo de setores", "level": "change", "placement": "disks",
+     "fixes": ["disk_sectors", "disk_smart"], "run": run_disk_test("long"),
+     "desc": "Lê toda a superfície do disco procurando setores defeituosos. Pode levar horas; o servidor continua funcionando."},
+    {"id": "fix.smartmontools", "group": "Discos", "label": "Instalar monitor de disco (smartmontools)", "level": "change", "timeout": 900,
+     "placement": "disks", "fixes": ["smart_missing"], "run": run_smartmontools,
+     "desc": "Instala o smartmontools para o painel ler a saúde física dos discos (setores, desgaste, temperatura)."},
+    {"id": "ssh.authorize_key", "group": "Usuários", "label": "Autorizar chave SSH", "level": "admin", "placement": "users", "run": run_authorize_key,
+     "desc": "Libera o acesso por chave SSH para o root ou para um usuário.",
+     "fields": [f_text("user", "Usuário", USER_RE, placeholder="root", suggest="users"),
+                dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE, placeholder="ssh-ed25519 AAAA… usuario@maquina", suggest="ssh_keys"), type="textarea")]},
     {"id": "service.logs", "group": "Serviços", "label": "Logs", "level": "read", "target": "service", "fields": F_SERVICE(),
      "desc": "Últimas 200 linhas de log de um serviço.", "run": run_service_logs},
     {"id": "service.status", "group": "Serviços", "label": "Status", "level": "read", "target": "service", "fields": F_SERVICE(),
@@ -1557,10 +1696,10 @@ ACTIONS = [
      "fields": [f_text("name", "Nome de usuário", USER_RE, placeholder="joao", help="minúsculas, números, - e _"),
                 f_select("shell", "Shell", ["/bin/bash", "/bin/sh", "/usr/sbin/nologin"]),
                 f_bool("sudo", "Administrador (sudo)"),
-                dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE, required=False, placeholder="ssh-ed25519 AAAA… usuario@maquina"), type="textarea")]},
+                dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE, required=False, placeholder="ssh-ed25519 AAAA… usuario@maquina", suggest="ssh_keys"), type="textarea")]},
     {"id": "users.add_key", "group": "Usuários", "label": "Adicionar chave SSH", "level": "admin", "target": "user", "run": run_user_add_key,
      "desc": "Autoriza mais uma chave SSH para o usuário.",
-     "fields": F_USER() + [dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE), type="textarea")]},
+     "fields": F_USER() + [dict(f_text("ssh_key", "Chave SSH pública", SSH_KEY_RE, suggest="ssh_keys"), type="textarea")]},
     {"id": "users.make_admin", "group": "Usuários", "label": "Tornar admin", "level": "admin", "target": "user", "run": run_user_sudo(True),
      "desc": "Dá permissão de administrador (sudo).", "fields": F_USER(), "when": "regular"},
     {"id": "users.remove_admin", "group": "Usuários", "label": "Tirar admin", "level": "admin", "target": "user", "run": run_user_sudo(False),
@@ -1657,6 +1796,7 @@ def collect_inventory(mode, with_packages):
     inv = {
         "system": safe(system_info, {}),
         "cloud": safe(cloud_info),
+        "disk_health": safe(disk_health),
         "services": safe(services, {"available": False, "units": []}),
         "ports": safe(ports, []),
         "docker": safe(docker),

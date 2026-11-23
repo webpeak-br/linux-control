@@ -276,3 +276,41 @@ class Datacenter(unittest.TestCase):
         with mock.patch.object(agent, "read", side_effect=lambda p, d="": "DigitalOcean" if p.endswith("sys_vendor") else ""), \
              mock.patch.object(agent, "meta_get", side_effect=OSError("timeout")):
             self.assertEqual(agent.cloud_info(), {"provider": "DigitalOcean"})
+
+
+class SaudeDosDiscos(unittest.TestCase):
+    SATA = {"model_name": "WDC WD40", "user_capacity": {"bytes": 4000787030016}, "rotation_rate": 5400, "device": {"protocol": "ATA"},
+            "smart_status": {"passed": True}, "temperature": {"current": 38}, "power_on_time": {"hours": 30000},
+            "ata_smart_attributes": {"table": [{"id": 5, "raw": {"value": 8}}, {"id": 197, "raw": {"value": 3}}, {"id": 9, "raw": {"value": 1}}]},
+            "ata_smart_self_test_log": {"standard": {"table": [{"type": {"string": "Extended offline"}, "status": {"string": "Completed: read failure", "passed": False}, "lifetime_hours": 29990}]}}}
+
+    def test_le_setores_e_ultimo_teste_do_smart(self):
+        with mock.patch.object(agent, "run", return_value=(4, agent.json.dumps(self.SATA))):
+            d = agent.smart_device("/dev/sda", "sat")
+        self.assertEqual((d["reallocated"], d["pending"], d["rotational"]), (8, 3, True))
+        self.assertFalse(d["last_test"]["passed"])
+
+    def test_nvme_traz_erros_de_midia_e_desgaste(self):
+        nv = {"model_name": "Samsung 980", "device": {"protocol": "NVMe"}, "smart_status": {"passed": True},
+              "nvme_smart_health_information_log": {"media_errors": 2, "critical_warning": 0, "percentage_used": 91, "available_spare": 100}}
+        with mock.patch.object(agent, "run", return_value=(0, agent.json.dumps(nv))):
+            d = agent.smart_device("/dev/nvme0", "nvme")
+        self.assertEqual((d["media_errors"], d["wear_pct"]), (2, 91))
+
+    def test_erros_do_kernel_ignoram_loop_e_cdrom(self):
+        log = "\n".join(["2026-11-23 kernel: blk_update_request: I/O error, dev sda, sector 1234 op 0x0:(READ)",
+                         "2026-11-23 kernel: Buffer I/O error on dev loop3, logical block 0",
+                         "2026-11-23 kernel: sr0: I/O error, dev sr0",
+                         "2026-11-23 kernel: ata1.00: failed command: READ FPDMA QUEUED",
+                         "2026-11-23 kernel: EXT4-fs error (device sda1): ext4_find_entry",
+                         "2026-11-23 kernel: eth0: link up"])
+        with mock.patch.object(agent, "which", return_value="/bin/journalctl"), mock.patch.object(agent, "run", return_value=(0, log)):
+            n, lines = agent.kernel_io_errors(24)
+        self.assertEqual(n, 3)
+
+    def test_chave_so_para_root_ou_pessoa(self):
+        sysacct = agent.pwd.struct_passwd(("www-data", "x", 33, 33, "", "/var/www", "/usr/sbin/nologin"))
+        with mock.patch.object(agent, "existing_user", return_value=sysacct), mock.patch.object(agent, "install_ssh_key") as inst:
+            rc, _ = agent.run_authorize_key({"user": "www-data", "ssh_key": "x"}, {})
+        self.assertEqual(rc, 1)
+        inst.assert_not_called()

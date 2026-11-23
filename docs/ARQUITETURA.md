@@ -99,6 +99,12 @@ Cada problema do diagnóstico (`hub/features/servers/health.js`) tem um `code` e
 - SSH: a opção é gravada em `/etc/ssh/sshd_config.d/00-linux-control.conf` (lido antes do `50-cloud-init.conf`; no sshd vale o primeiro valor) ou no topo do `sshd_config`. Antes de valer, passa por `sshd -t` e é desfeita se falhar. A ação recusa quando ninguém mais conseguiria entrar (nenhum administrador com chave).
 - Firewall: liga o UFW (ou firewalld) mantendo abertas o SSH e todas as portas que já escutam fora do loopback.
 
+## Discos, localização e chaves SSH
+
+- **Saúde dos discos** (`disk_health` no inventário): SMART de cada disco físico via `smartctl -j` (setores remapeados, pendentes e irrecuperáveis; erros de mídia e desgaste no NVMe; último autoteste) e erros de leitura e gravação no log do kernel, que valem também em máquina virtual. Os limites ficam em `health.js`; a aba Discos só mostra.
+- **Datacenter** (`cloud`): o agente reconhece o provedor pelo DMI e só então consulta a região no serviço de metadados do próprio provedor. **Localização do IP** (`geo`): o hub consulta o IP público no ipinfo.io e guarda por 7 dias (`LCTL_GEOIP=0` desliga).
+- **Chaves SSH**: a biblioteca (`features/keys`) guarda só chaves públicas e recusa chave privada. Elas são instaladas pela ação `ssh.authorize_key`, que aceita root ou contas de pessoa. É o único id de ação citado na interface (`AUTHORIZE_KEY_ACTION`), porque a instalação em vários servidores não parte do catálogo de um servidor só.
+
 ## Protocolo agente ↔ hub
 
 - `POST /api/agent/report` com `Authorization: Bearer <token>` e corpo `{ agent_version, interval, metrics, results: [{id, exit_code, output, duration}], inventory? }`. O inventário traz `actions` (catálogo) e, a cada 6 h, `packages`.

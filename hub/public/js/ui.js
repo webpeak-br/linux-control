@@ -90,7 +90,11 @@ export function formFields(fields, values = {}, suggestions = {}) {
     if (f.type === 'select') {
       input = `<select id="${id}">${(f.options || []).map(o => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     } else if (f.type === 'textarea') {
-      input = `<textarea id="${id}" rows="3" placeholder="${esc(f.placeholder || '')}">${esc(v || '')}</textarea>`;
+      // Sugestões com rótulo (ex.: chaves SSH salvas) viram um seletor que preenche o campo.
+      const list = (suggestions[f.suggest] || []).filter(o => o && o.value);
+      input = (list.length ? `<select data-fill="${id}"><option value="">Escolher uma chave cadastrada…</option>${list.map(o =>
+        `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('')}</select>` : '')
+        + `<textarea id="${id}" rows="3" placeholder="${esc(f.placeholder || '')}">${esc(v || '')}</textarea>`;
     } else {
       const list = suggestions[f.suggest];
       input = `<input type="text" id="${id}" value="${esc(v || '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="off"${list ? ` list="${id}_l"` : ''}>`
@@ -103,6 +107,7 @@ export function formFields(fields, values = {}, suggestions = {}) {
 // Liga os campos que têm comportamento próprio (hoje, o montador de cron). Chamar depois de inserir formFields.
 export function bindFields(root, fields) {
   for (const f of fields) if (f.type === 'cron') bindCron(root, fieldId(f));
+  root.querySelectorAll('select[data-fill]').forEach(s => { s.onchange = () => { if (s.value) root.querySelector('#' + s.dataset.fill).value = s.value; }; });
 }
 
 export function readForm(root, fields) {

@@ -160,3 +160,27 @@ describe('interface', () => {
     } finally { hub.stop(); }
   });
 });
+
+describe('biblioteca de chaves SSH', () => {
+  let hub;
+  const pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0n7Xb9mWkq1f3mJ8l0j0tq3k2m0c8m7d1x2y3z4w5 ana@note';
+  before(async () => { hub = await startHub(); await setupAdmin(hub); });
+  after(() => hub.stop());
+
+  test('cadastra, recusa duplicada, lista com impressão digital e remove', async () => {
+    const r = await hub.call('POST', '/api/ssh-keys', { body: { name: '', key: pub } });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.key.name, 'ana@note');
+    assert.equal((await hub.call('POST', '/api/ssh-keys', { body: { key: pub.replace('ana@note', 'outro') } })).status, 409);
+    const l = await hub.call('GET', '/api/ssh-keys');
+    assert.equal(l.body.keys.length, 1);
+    assert.match(l.body.keys[0].fingerprint, /^SHA256:/);
+    assert.equal((await hub.call('DELETE', `/api/ssh-keys/${r.body.key.id}`)).status, 200);
+    assert.equal((await hub.call('GET', '/api/ssh-keys')).body.keys.length, 0);
+  });
+
+  test('sem sessão não lista chaves', async () => {
+    hub.forgetCookie();
+    assert.equal((await hub.call('GET', '/api/ssh-keys')).status, 401);
+  });
+});

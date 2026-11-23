@@ -1,16 +1,17 @@
-// Configurações do painel: conta, alertas por e-mail, licença, atualizações e auditoria.
+// Configurações do painel: conta, chaves SSH, alertas por e-mail, licença, atualizações e auditoria.
 import { api } from '../api.js';
 import { esc, dt, ago } from '../util.js';
-import { toast } from '../ui.js';
+import { toast, modal } from '../ui.js';
+import { AUTHORIZE_KEY_ACTION } from '../actions.js';
 
-const SECTIONS = { account: 'Conta', alerts: 'Alertas por e-mail', license: 'Licença', updates: 'Atualizações', audit: 'Auditoria' };
+const SECTIONS = { account: 'Conta', keys: 'Chaves SSH', alerts: 'Alertas por e-mail', license: 'Licença', updates: 'Atualizações', audit: 'Auditoria' };
 
 export function settingsView(root, section) {
   const key = SECTIONS[section] ? section : 'account';
   root.innerHTML = `<div class="settings"><nav class="side">${Object.entries(SECTIONS).map(([k, l]) =>
     `<a href="#/settings/${k}" class="${k === key ? 'on' : ''}">${l}</a>`).join('')}</nav><section id="sec"><div class="muted">Carregando…</div></section></div>`;
   const el = root.querySelector('#sec');
-  ({ account, alerts, license, updates, audit })[key](el).catch(e => { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; });
+  ({ account, keys, alerts, license, updates, audit })[key](el).catch(e => { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; });
   return {};
 }
 
@@ -34,6 +35,71 @@ async function account(el) {
       toast('Senha alterada.'); el.querySelector('#pf').reset();
     } catch (err) { el.querySelector('#pe').textContent = err.message; }
   };
+}
+
+// Chaves SSH públicas da equipe: cadastre uma vez e instale em qualquer servidor.
+async function keys(el) {
+  const { keys: list } = await api('/api/ssh-keys');
+  const rows = list.map(k => `<tr><td><b>${esc(k.name)}</b><div class="dim small mono">${esc(k.key.split(' ')[0])} · ${esc(k.fingerprint)}</div></td>
+    <td class="small muted">${dt(k.added)}</td>
+    <td class="acts"><button class="btn sm primary" data-install="${esc(k.id)}">Instalar em servidores</button>
+    <button class="btn sm danger" data-del="${esc(k.id)}">Remover</button></td></tr>`).join('');
+  el.innerHTML = `<div class="panel"><h3>Chaves SSH da equipe</h3>
+      <p class="small muted">Cadastre aqui as chaves públicas que você já usa para entrar nos servidores e instale com um clique em um ou vários servidores.
+      Só a chave <b>pública</b> (arquivo <code>.pub</code>) é aceita.</p>
+      <div class="tbl-wrap"><table><tbody>${rows || '<tr><td class="muted">Nenhuma chave cadastrada.</td></tr>'}</tbody></table></div></div>
+    <div class="panel narrow"><h3>Cadastrar chave</h3><form id="kf">
+      ${row('kn', 'Nome', text('kn', '', 'placeholder="Notebook do Marcos" maxlength="80"'), 'Vazio usa o comentário da chave.')}
+      ${row('kk', 'Chave pública', '<textarea id="kk" rows="4" placeholder="ssh-ed25519 AAAA… usuario@maquina"></textarea>',
+        'No seu computador: <code>cat ~/.ssh/id_ed25519.pub</code> (Windows: <code>type %USERPROFILE%\\.ssh\\id_ed25519.pub</code>).')}
+      ${row('kfile', 'Ou envie o arquivo .pub', '<input type="file" id="kfile" accept=".pub,text/plain">')}
+      <div class="err" id="ke"></div><button class="btn primary mt">Cadastrar</button></form></div>`;
+  el.querySelector('#kfile').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (f.size > 20000) { el.querySelector('#ke').textContent = 'Arquivo grande demais para uma chave pública.'; return; }
+    el.querySelector('#kk').value = (await f.text()).trim();
+    if (!el.querySelector('#kn').value) el.querySelector('#kn').value = f.name.replace(/\.pub$/, '');
+  };
+  el.querySelector('#kf').onsubmit = async e => {
+    e.preventDefault();
+    try {
+      await api('/api/ssh-keys', { method: 'POST', body: { name: el.querySelector('#kn').value, key: el.querySelector('#kk').value } });
+      toast('Chave cadastrada.'); keys(el);
+    } catch (err) { el.querySelector('#ke').textContent = err.message; }
+  };
+  el.querySelectorAll('[data-del]').forEach(b => {
+    b.onclick = async () => {
+      if (!confirm('Remover a chave do painel? Ela continua autorizada nos servidores onde já foi instalada.')) return;
+      try { await api(`/api/ssh-keys/${b.dataset.del}`, { method: 'DELETE' }); keys(el); } catch (err) { toast(err.message); }
+    };
+  });
+  el.querySelectorAll('[data-install]').forEach(b => { b.onclick = () => installKey(list.find(k => k.id === b.dataset.install)); });
+}
+
+async function installKey(k) {
+  const { servers } = await api('/api/servers');
+  modal(`<h2>Instalar ${esc(k.name)}</h2><p>A chave é adicionada ao <code>authorized_keys</code> do usuário escolhido. Exige o agente no modo admin.</p>
+    <form id="ik">${row('iu', 'Usuário', text('iu', 'root', 'autocomplete="off"'), 'root ou uma conta de pessoa (UID 1000 ou maior).')}
+    <label>Servidores</label><div class="checks">${servers.map(s => check(`is${Number(s.id)}`, `${esc(s.name)} <span class="dim small">${esc((s.system && s.system.hostname) || '')}</span>`, false)).join('')}</div>
+    <div class="small"><a href="#" id="iall">marcar todos</a></div><div class="err" id="ie"></div><div id="ires" class="small"></div>
+    <div class="foot"><button type="button" class="btn ghost" data-close>Fechar</button><button class="btn primary">Instalar</button></div></form>`, box => {
+    box.querySelector('#iall').onclick = e => { e.preventDefault(); box.querySelectorAll('.checks input').forEach(c => { c.checked = true; }); };
+    box.querySelector('#ik').onsubmit = async e => {
+      e.preventDefault();
+      const user = box.querySelector('#iu').value.trim();
+      const chosen = servers.filter(s => box.querySelector(`#is${Number(s.id)}`).checked);
+      if (!chosen.length) { box.querySelector('#ie').textContent = 'Escolha pelo menos um servidor.'; return; }
+      const res = box.querySelector('#ires');
+      res.innerHTML = '';
+      for (const s of chosen) {
+        try {
+          const r = await api(`/api/servers/${Number(s.id)}/commands`, { method: 'POST', body: { action: AUTHORIZE_KEY_ACTION, params: { user, ssh_key: k.key } } });
+          res.insertAdjacentHTML('beforeend', `<div>✓ ${esc(s.name)}: enviado. <a href="#/server/${Number(s.id)}/actions/${Number(r.id)}">ver resultado</a></div>`);
+        } catch (err) { res.insertAdjacentHTML('beforeend', `<div class="err">✗ ${esc(s.name)}: ${esc(err.message)}</div>`); }
+      }
+    };
+  });
 }
 
 async function alerts(el) {
